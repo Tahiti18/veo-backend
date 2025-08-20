@@ -1,25 +1,33 @@
-# Veo Backend (Live Integration)
+# Veo Backend Live (Fast + Quality)
 
-This backend connects directly to **fal.ai Veo 3** (Fast & Quality).
-
-## Endpoints
-- `GET /` → Health check
-- `POST /generate-fast` → Generates with `fal-ai/veo3/fast`
-- `POST /generate-quality` → Generates with `fal-ai/veo3`
-
-## Request Body Example
-```json
-{
-  "prompt": "A cinematic drone shot flying over a futuristic neon city at night",
-  "audio": false,
-  "duration": 8,
-  "aspect_ratio": "16:9"
-}
-```
+This is a Railway-ready backend to run Google Veo 3 video generation (Fast + Quality) via fal.ai.
 
 ## Setup
-1. Create a GitHub repo, upload files.
-2. Deploy on Railway.
-3. Add Environment Variable: `FAL_KEY=your_fal_ai_api_key`
-4. Expose service to internet.
-5. Test with Postman or curl.
+
+1. Create `.env` in root:
+   ```
+   FAL_API_KEY=your_fal_ai_key_here
+   PORT=8080
+   ```
+
+2. Install dependencies:
+   ```
+   npm install
+   ```
+
+3. Run locally:
+   ```
+   npm start
+   ```
+
+4. Deploy to Railway:
+   - Push repo to GitHub
+   - Link project in Railway
+   - Add `FAL_API_KEY` in Railway → Variables
+   - Done ✅
+
+## Endpoints
+
+- `POST /generate-fast` → returns video url (fast mode)
+- `POST /generate-quality` → returns video url (quality mode)
+- `GET /` → status check
