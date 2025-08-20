@@ -1,0 +1,15 @@
+{
+  "name": "veo-backend",
+  "version": "1.0.0",
+  "description": "Railway backend proxy for fal.ai Veo 3 Fast",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.3",
+    "cors": "^2.8.5"
+  }
+}
