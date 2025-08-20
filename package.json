@@ -1,8 +1,9 @@
 {
-  "name": "veo-backend",
-  "version": "1.0.0",
-  "description": "Railway backend proxy for fal.ai Veo 3 Fast",
+  "name": "veo-backend-advanced",
+  "version": "1.1.0",
+  "description": "Railway backend proxy for fal.ai Veo 3 (Fast & Quality) with extras",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
