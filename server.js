@@ -1,41 +1,33 @@
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import axios from "axios";
+import dotenv from "dotenv";
 
 dotenv.config();
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
-// Root status check
+const PORT = process.env.PORT || 8080;
+
+// Health check
 app.get("/", (req, res) => {
-  res.json({ status: "✅ Veo 3 backend live on Railway" });
+  res.json({ status: "🚀 Veo 3 Live Backend Running with ESM" });
 });
 
 // Fast generation endpoint
 app.post("/generate-fast", async (req, res) => {
   try {
     const { prompt } = req.body;
-    if (!prompt) return res.status(400).json({ error: "No prompt provided" });
+    if (!prompt) return res.status(400).json({ error: "Prompt required" });
 
-    // Example fal.ai call
-    const response = await axios.post(
-      "https://fal.run/google/veo-fast",
-      { prompt },
-      {
-        headers: {
-          Authorization: `Key ${process.env.FAL_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
+    // Example call to fal.ai or another API (replace with live API)
+    const response = await axios.post("https://api.fal.ai/generate-fast", { prompt });
 
-    res.json({ videoUrl: response.data.video_url || response.data });
+    res.json({ success: true, data: response.data });
   } catch (err) {
-    console.error("Fast gen error:", err.message);
-    res.status(500).json({ error: "Fast generation failed" });
+    console.error("Fast Gen Error:", err.message);
+    res.status(500).json({ error: "Generation failed" });
   }
 });
 
@@ -43,28 +35,17 @@ app.post("/generate-fast", async (req, res) => {
 app.post("/generate-quality", async (req, res) => {
   try {
     const { prompt } = req.body;
-    if (!prompt) return res.status(400).json({ error: "No prompt provided" });
+    if (!prompt) return res.status(400).json({ error: "Prompt required" });
 
-    const response = await axios.post(
-      "https://fal.run/google/veo-quality",
-      { prompt },
-      {
-        headers: {
-          Authorization: `Key ${process.env.FAL_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
+    const response = await axios.post("https://api.fal.ai/generate-quality", { prompt });
 
-    res.json({ videoUrl: response.data.video_url || response.data });
+    res.json({ success: true, data: response.data });
   } catch (err) {
-    console.error("Quality gen error:", err.message);
-    res.status(500).json({ error: "Quality generation failed" });
+    console.error("Quality Gen Error:", err.message);
+    res.status(500).json({ error: "Generation failed" });
   }
 });
 
-// Listen on Railway's port
-const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`🚀 Veo backend listening on ${PORT}`);
+  console.log(`🚀 Veo backend live on port ${PORT}`);
 });

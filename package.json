@@ -3,6 +3,7 @@
   "version": "1.0.1",
   "description": "Live Veo 3 backend (Fast + Quality) with fal.ai integration",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
