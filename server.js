@@ -1,53 +1,70 @@
-// server.js
+// server.js (Live Veo 3 Backend)
 const express = require("express");
-const bodyParser = require("body-parser");
+const axios = require("axios");
+const dotenv = require("dotenv");
 const cors = require("cors");
+
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
 
 // Health check
 app.get("/", (req, res) => {
-  res.json({ status: "✅ Veo 3 Advanced Backend Running" });
+  res.json({ status: "✅ Veo 3 Backend Running (Live)", version: "1.0.1" });
 });
 
-// Generate fast video (mock example)
+// Helper to call fal.ai
+async function callFal(endpoint, input) {
+  const response = await axios.post(endpoint, { input }, {
+    headers: {
+      Authorization: `Key ${process.env.FAL_KEY}`,
+      "Content-Type": "application/json"
+    },
+    timeout: 600000
+  });
+  return response.data;
+}
+
+// Generate Fast video (8 sec max)
 app.post("/generate-fast", async (req, res) => {
-  const { prompt, resolution, fps, duration, seed, audio } = req.body;
-
-  // Simulate backend request (you would replace with actual VEO API call)
-  res.json({
-    status: "success",
-    message: "Fast video generated",
-    params: { prompt, resolution, fps, duration, seed, audio },
-    url: "https://example.com/generated_video.mp4"
-  });
+  try {
+    const { prompt, audio = false, duration = 8, aspect_ratio = "16:9" } = req.body;
+    const data = await callFal("https://fal.run/fal-ai/veo3/fast", {
+      prompt,
+      audio_enabled: audio,
+      duration,
+      aspect_ratio
+    });
+    const url = data?.video_url || data?.output?.[0]?.url || null;
+    res.json({ success: true, video_url: url, raw: data });
+  } catch (err) {
+    console.error(err.response?.data || err.message);
+    res.status(500).json({ success: false, error: err.response?.data || err.message });
+  }
 });
 
-// Generate quality video (mock example)
+// Generate Quality video
 app.post("/generate-quality", async (req, res) => {
-  const { prompt, resolution, fps, duration, seed, audio } = req.body;
-
-  res.json({
-    status: "success",
-    message: "Quality video generated",
-    params: { prompt, resolution, fps, duration, seed, audio },
-    url: "https://example.com/generated_quality.mp4"
-  });
-});
-
-// Metrics endpoint
-app.get("/metrics", (req, res) => {
-  res.json({
-    uptime: process.uptime(),
-    memoryUsage: process.memoryUsage(),
-    timestamp: Date.now()
-  });
+  try {
+    const { prompt, audio = false, duration = 8, aspect_ratio = "16:9" } = req.body;
+    const data = await callFal("https://fal.run/fal-ai/veo3", {
+      prompt,
+      audio_enabled: audio,
+      duration,
+      aspect_ratio
+    });
+    const url = data?.video_url || data?.output?.[0]?.url || null;
+    res.json({ success: true, video_url: url, raw: data });
+  } catch (err) {
+    console.error(err.response?.data || err.message);
+    res.status(500).json({ success: false, error: err.response?.data || err.message });
+  }
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Veo backend listening on port ${PORT}`);
+  console.log(`🚀 Veo backend listening on ${PORT}`);
 });
