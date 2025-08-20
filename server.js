@@ -25,6 +25,16 @@ app.get("/", (req, res) => {
   });
 });
 
+// ---- TEMP DIAG: confirm FAL_KEY is loaded (masked)
+app.get("/_keycheck", (req, res) => {
+  const v = process.env.FAL_KEY || "";
+  res.json({
+    present: !!v,
+    length: v.length,
+    preview: v ? v.slice(0, 8) + "..." + v.slice(-8) : null
+  });
+});
+
 // ---- utils
 const FAST_ENDPOINT =
   process.env.FAL_VEO3_FAST || "https://fal.run/fal-ai/veo3/fast";
@@ -76,7 +86,6 @@ async function callFal(endpoint, input) {
       const r2 = await axios.post(endpoint, input, cfg);
       return r2.data;
     } catch (e2) {
-      // bubble up the more informative error
       const errData = e2.response?.data ?? e1.response?.data ?? e2.message ?? e1.message;
       const err = new Error(typeof errData === "string" ? errData : JSON.stringify(errData));
       err.status = e2.response?.status || e1.response?.status || 500;
