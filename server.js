@@ -1,5 +1,6 @@
-// server.js — FIX for 404 (tries multiple KIE paths) + taskId polling
+// server.js — KIE backend with working routes + preflight + multi-path submit/poll
 // ENV: KIE_KEY (required); optional KIE_API_PREFIX (default https://api.kie.ai/api/v1), CORS_ORIGIN, PORT, CONCURRENCY
+
 import express from "express";
 import cors from "cors";
 import axios from "axios";
@@ -17,16 +18,24 @@ const MAX   = Math.max(1, Number(process.env.CONCURRENCY || 1));
 app.use(cors({ origin: ORIG }));
 app.use(express.json({ limit: "2mb" }));
 
+// ------- health
 app.get("/", (_req,res)=> res.json({ ok:true, service:"kie-backend", time:new Date().toISOString() }));
 app.get("/health", (_req,res)=> res.json({ ok:true, api_prefix: API, kie_key_present: !!KEY }));
 
+// ------- CORS preflight (important: avoids 404 on OPTIONS)
+app.options("/generate-fast", cors());
+app.options("/generate-quality", cors());
+
+// ------- tiny queue
 let active=0; const q=[];
 function enqueue(run){ return new Promise((resolve,reject)=>{ q.push({run,resolve,reject}); pump(); }); }
 async function pump(){ if(active>=MAX||!q.length) return; active++; const j=q.shift(); try{ j.resolve(await j.run()); }catch(e){ j.reject(e); }finally{ active--; setImmediate(pump); } }
 
+// ------- input guard
 const RATIOS = new Set(["16:9","9:16","1:1","4:3","3:4"]);
 const RES    = new Set(["720p","1080p"]);
 const clamp  = s => Math.max(1, Math.min(8, Math.round(Number(s||8)*10)/10));
+
 function sanitize(b={}){
   const { prompt, duration, aspect_ratio, with_audio, audio, resolution, style, negative_prompt, seed } = b;
   if(!prompt || !String(prompt).trim()){ const e=new Error("Prompt is required"); e.status=400; throw e; }
@@ -43,15 +52,19 @@ function sanitize(b={}){
   return out;
 }
 
-function headers(){ return { Authorization: `Bearer ${KEY}`, "x-api-key": KEY, "Content-Type":"application/json" }; }
+// ------- KIE helpers
+function authHeaders(){
+  if(!KEY){ const e=new Error("Missing KIE_KEY"); e.status=500; throw e; }
+  return { Authorization: `Bearer ${KEY}`, "x-api-key": KEY, "Content-Type":"application/json" };
+}
 async function kiePost(path, payload){
   const url = `${API}${path}`;
-  const { data } = await axios.post(url, payload, { headers: headers(), timeout: 600_000 });
+  const { data } = await axios.post(url, payload, { headers: authHeaders(), timeout: 600_000 });
   return data;
 }
 async function kieGet(path, params){
   const url = `${API}${path}`;
-  const { data } = await axios.get(url, { params, headers: headers(), timeout: 60_000 });
+  const { data } = await axios.get(url, { params, headers: authHeaders(), timeout: 60_000 });
   return data;
 }
 function pickTaskId(sub){
@@ -91,6 +104,7 @@ async function pollAny(taskId){
   const e=new Error("Render timeout"); e.status=504; throw e;
 }
 
+// ------- unified handler
 async function handleGenerate(req,res){
   const reqId = crypto.randomBytes(5).toString("hex");
   try{
@@ -109,7 +123,8 @@ async function handleGenerate(req,res){
   }
 }
 
-app.post("/generate-fast",(req,res)=>{ req.body={...req.body,tier:"fast"}; handleGenerate(req,res); });
+// ------- routes your UI calls
+app.post("/generate-fast",(req,res)=>{ req.body={...req.body,tier:"fast"};    handleGenerate(req,res); });
 app.post("/generate-quality",(req,res)=>{ req.body={...req.body,tier:"quality"}; handleGenerate(req,res); });
 
 app.listen(PORT, ()=> console.log(`🚀 KIE backend (LIVE) on ${PORT} | CONCURRENCY=${MAX}`));
