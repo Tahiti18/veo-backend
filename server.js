@@ -106,8 +106,8 @@ async function pollTask(statusPath, taskId){
 // ---------- endpoints (veo with auto-fallback to veo3)
 function endpoints(tier="fast"){
   return {
-    submit: "/veo/generate",
-    status: "/veo/record-info",
+    submit: "/video/gen",
+    status: "/video/status",
     payload: { mode: tier==="quality" ? "quality" : "fast" },
     tag: `kie.veo3.${tier}`
   };
