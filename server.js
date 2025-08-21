@@ -1,6 +1,7 @@
 // server.js (ESM) — Veo 3 via fal.run (hardened + shape-agnostic)
 // Requires: express, cors, axios, dotenv
-// ENV: FAL_KEY (required), PORT (optional), FAL_VEO3_FAST (optional), FAL_VEO3_QUALITY (optional)
+// ENV: FAL_KEY (required), PORT (optional),
+//      FAL_VEO3_FAST (optional), FAL_VEO3_QUALITY (optional)
 
 import express from "express";
 import cors from "cors";
@@ -13,15 +14,29 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // ---- middleware
-app.use(cors());                // allow Netlify/frontends
+app.use(cors()); // allow frontend origins (adjust if you need strict CORS)
 app.use(express.json({ limit: "2mb" }));
 
-// ---- quick health
+// ---- quick root ping
 app.get("/", (req, res) => {
   res.json({
     status: "✅ Veo 3 Backend Running (LIVE fal.run)",
-    version: "1.1.0",
+    version: "1.2.0",
     time: new Date().toISOString()
+  });
+});
+
+// ---- health (so you don’t see “Cannot GET /health” again)
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "veo-backend",
+    time: new Date().toISOString(),
+    env: {
+      fal_key_present: Boolean(process.env.FAL_KEY),
+      fast_endpoint: process.env.FAL_VEO3_FAST || "https://fal.run/fal-ai/veo3/fast",
+      quality_endpoint: process.env.FAL_VEO3_QUALITY || "https://fal.run/fal-ai/veo3"
+    }
   });
 });
 
@@ -42,19 +57,34 @@ const QUALITY_ENDPOINT =
   process.env.FAL_VEO3_QUALITY || "https://fal.run/fal-ai/veo3";
 
 const ALLOWED_RATIOS = new Set(["16:9", "9:16", "1:1", "4:3", "3:4"]);
-const ALLOWED_RES = new Set(["720p", "1080p", "4k", "4K", "2k", "2K", "1440p"]);
+const ALLOWED_RES = new Set(["720p", "1080p", "1440p", "2k", "2K", "4k", "4K"]);
 
 function clampDuration(d) {
   const n = Number(d);
   if (!Number.isFinite(n)) return 8;
-  // keep one decimal (7.7s etc), max 8s per Veo Fast docs
+  // allow one decimal, bound 1..8 sec (fast tier typically caps at ~8s)
   return Math.max(1, Math.min(8, Math.round(n * 10) / 10));
 }
 
-function sanitize({ prompt, audio, duration, aspect_ratio, resolution, seed }) {
+function sanitize(body = {}) {
+  const {
+    prompt,
+    audio,
+    duration,
+    aspect_ratio,
+    resolution,
+    seed
+  } = body;
+
+  if (!prompt || !String(prompt).trim()) {
+    const e = new Error("Prompt is required.");
+    e.status = 400;
+    throw e;
+  }
+
   return {
     prompt: String(prompt),
-    audio_enabled: !!audio,
+    audio_enabled: Boolean(audio),
     duration: clampDuration(duration ?? 8),
     aspect_ratio: ALLOWED_RATIOS.has(String(aspect_ratio)) ? String(aspect_ratio) : "16:9",
     resolution: ALLOWED_RES.has(String(resolution)) ? String(resolution) : "1080p",
@@ -62,11 +92,15 @@ function sanitize({ prompt, audio, duration, aspect_ratio, resolution, seed }) {
   };
 }
 
-// FAL sometimes expects { input: {...} } (Replicate-style) or a top-level body { ... }.
-// Try both shapes automatically.
+// fal.run APIs vary between { input: {...} } and top-level {...}.
+// Try both shapes automatically and surface the best error.
 async function callFal(endpoint, input) {
   const { FAL_KEY } = process.env;
-  if (!FAL_KEY) throw new Error("Missing FAL_KEY env var.");
+  if (!FAL_KEY) {
+    const e = new Error("Missing FAL_KEY env var.");
+    e.status = 500;
+    throw e;
+  }
 
   const cfg = {
     headers: {
@@ -87,14 +121,16 @@ async function callFal(endpoint, input) {
       return r2.data;
     } catch (e2) {
       const errData = e2.response?.data ?? e1.response?.data ?? e2.message ?? e1.message;
-      const err = new Error(typeof errData === "string" ? errData : JSON.stringify(errData));
-      err.status = e2.response?.status || e1.response?.status || 500;
+      const err = new Error(
+        typeof errData === "string" ? errData : JSON.stringify(errData)
+      );
+      err.status = e2.response?.status || e1.response?.status || 502;
       throw err;
     }
   }
 }
 
-// Normalize the many output shapes fal.run models use
+// Normalize various output shapes into { url, meta, raw }
 function pickUrl(data) {
   return (
     data?.video_url ||
@@ -105,7 +141,9 @@ function pickUrl(data) {
     data?.result?.video?.url ||
     data?.assets?.video?.url ||
     data?.videos?.[0]?.url ||
-    data?.media?.find?.(m => m?.url && String(m?.content_type || "").includes("video"))?.url ||
+    (Array.isArray(data?.media)
+      ? data.media.find(m => m?.url && String(m?.content_type || "").includes("video"))?.url
+      : null) ||
     null
   );
 }
@@ -125,12 +163,7 @@ function normalizeResponse(data) {
 // POST /generate-fast  (Veo 3 Fast — up to ~8s)
 app.post("/generate-fast", async (req, res) => {
   try {
-    const { prompt } = req.body || {};
-    if (!prompt || !String(prompt).trim()) {
-      return res.status(400).json({ success: false, error: "Prompt is required." });
-    }
-
-    const payload = sanitize(req.body || {});
+    const payload = sanitize(req.body);
     const data = await callFal(FAST_ENDPOINT, payload);
     const { url, meta, raw } = normalizeResponse(data);
 
@@ -148,15 +181,10 @@ app.post("/generate-fast", async (req, res) => {
   }
 });
 
-// POST /generate-quality (Veo 3 Quality)
+// POST /generate-quality (Veo 3 Quality — longer/more detailed)
 app.post("/generate-quality", async (req, res) => {
   try {
-    const { prompt } = req.body || {};
-    if (!prompt || !String(prompt).trim()) {
-      return res.status(400).json({ success: false, error: "Prompt is required." });
-    }
-
-    const payload = sanitize(req.body || {});
+    const payload = sanitize(req.body);
     const data = await callFal(QUALITY_ENDPOINT, payload);
     const { url, meta, raw } = normalizeResponse(data);
 
