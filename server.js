@@ -1,6 +1,5 @@
-// server.js — KIE-only backend (ESM) with webhooks + unified generate
-// ENV: KIE_KEY (required), KIE_API_PREFIX (default https://api.kie.ai/api/v1), PORT
-//      CORS_ORIGIN (optional, e.g. https://justfomo.com)
+// server.js — KIE-only backend with enforced CONCURRENCY queue
+// ENV: KIE_KEY, KIE_API_PREFIX (default https://api.kie.ai/api/v1), PORT, CORS_ORIGIN, CONCURRENCY
 
 import express from "express";
 import cors from "cors";
@@ -15,35 +14,66 @@ const API = (process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1").replace(
 const KEY = process.env.KIE_KEY;
 const ORIGIN = process.env.CORS_ORIGIN || "*";
 
-// ---------- middleware
+// ---------------- middleware
 app.use(cors({ origin: ORIGIN, credentials: false }));
 app.use(express.json({ limit: "2mb" }));
 
-// tiny rate cap: 30 requests / 60s per ip
+// ---------------- simple rate guard (optional)
 const BUCKET = new Map();
 app.use((req,res,next)=>{
   const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip || "local";
   const now = Date.now();
   const w = BUCKET.get(ip) || [];
-  const w2 = w.filter(t=> now - t < 60_000);
+  const w2 = w.filter(t => now - t < 60_000);
   w2.push(now);
   BUCKET.set(ip, w2);
-  if (w2.length > 30) return res.status(429).json({ success:false, error:"Rate limit exceeded" });
+  if (w2.length > 60) return res.status(429).json({ success:false, error:"Rate limit exceeded" });
   next();
 });
 
-// ---------- health & root
+// ---------------- health
 app.get("/", (_req, res) =>
-  res.json({ status: "✅ Kie.ai backend running", version: "2.1.0", time: new Date().toISOString() })
+  res.json({ status: "✅ Kie.ai backend running", version: "2.2.0", time: new Date().toISOString() })
 );
-
 app.get("/health", (_req, res) =>
   res.json({ ok: true, service: "kie-backend", api_prefix: API, kie_key_present: Boolean(KEY) })
 );
 
-// ---------- helpers
+// ---------------- CONCURRENCY QUEUE (this is the limiter)
+const MAX = Math.max(1, Number(process.env.CONCURRENCY || 2));
+let active = 0;
+const queue = []; // FIFO of { run, resolve, reject, id }
+
+function stats() { return { max: MAX, active, queued: queue.length }; }
+app.get("/stats", (_req,res)=> res.json({ ok:true, ...stats() }));
+
+function enqueue(run) {
+  const id = crypto.randomBytes(6).toString("hex");
+  return new Promise((resolve, reject) => {
+    queue.push({ run, resolve, reject, id });
+    tick();
+  });
+}
+async function tick() {
+  if (active >= MAX) return;
+  const next = queue.shift();
+  if (!next) return;
+  active++;
+  try {
+    const out = await next.run();
+    next.resolve(out);
+  } catch (e) {
+    next.reject(e);
+  } finally {
+    active--;
+    setImmediate(tick);
+  }
+}
+
+// ---------------- helpers
 const ALLOWED_RATIOS = new Set(["16:9", "9:16", "1:1", "4:3", "3:4"]);
 const clamp = d => { const n=Number(d); if(!Number.isFinite(n)) return 8; return Math.max(1, Math.min(8, Math.round(n*10)/10)); };
+const rid = () => crypto.randomBytes(6).toString("hex");
 
 function sanitize(body = {}) {
   const { prompt, duration, fps, aspect_ratio, seed, with_audio } = body;
@@ -57,7 +87,6 @@ function sanitize(body = {}) {
     with_audio: with_audio === false ? false : true
   };
 }
-const rid = () => crypto.randomBytes(6).toString("hex");
 
 async function kiePost(path, payload){
   if (!KEY) { const e=new Error("Missing KIE_KEY"); e.status=500; throw e; }
@@ -85,75 +114,57 @@ async function pollUntil(path, id){
   const e=new Error("Render timeout"); e.status=504; throw e;
 }
 
-// map model/tier → kie endpoints
-function endpoints({ model="veo", tier="fast" }){
-  if (model === "veo") {
-    return { submit: "/veo/generate", status: "/veo/record-info", payload: { mode: tier === "quality" ? "quality" : "fast" } };
-  }
-  if (model === "runway") {
-    return { submit: "/runway/generate", status: "/runway/record-info", payload: {} };
-  }
+function endpoints(model="veo", tier="fast"){
+  if (model === "veo") return { submit:"/veo/generate", status:"/veo/record-info", payload:{ mode: tier==="quality" ? "quality" : "fast" }, tag:`kie.veo3.${tier}` };
+  if (model === "runway") return { submit:"/runway/generate", status:"/runway/record-info", payload:{}, tag:"kie.runway" };
   const e=new Error('Invalid model. Use "veo" or "runway".'); e.status=400; throw e;
 }
 
-// ---------- Unified generate (supports callback_url to avoid polling)
+// ---------------- unified generate (queued; respects CONCURRENCY)
 app.post("/generate", async (req, res) => {
   const request_id = rid();
   try {
     const { model="veo", tier="fast", callback_url } = req.body || {};
     const p = sanitize(req.body);
-    const ep = endpoints({ model, tier });
+    const ep = endpoints(model, tier);
 
-    const sub = await kiePost(ep.submit, { ...ep.payload, ...p, ...(callback_url ? { callback_url } : {}) });
+    // Enqueue the submission so only MAX jobs enter KIE at once
+    const sub = await enqueue(() => kiePost(ep.submit, { ...ep.payload, ...p, ...(callback_url ? { callback_url } : {}) }));
+
     const jobId = sub.id || sub.job_id;
     if (!jobId) return res.status(502).json({ success:false, error:"No job id from KIE", raw: sub, request_id });
 
-    // If callback_url provided, return immediately (no polling)
+    // If webhook callback provided, return immediately after submission
     if (callback_url) {
-      return res.json({ success:true, enqueued:true, job_id: jobId, model, tier, request_id });
+      return res.json({ success:true, enqueued:true, job_id: jobId, model, tier, request_id, queue: stats() });
     }
 
-    // Otherwise poll until done
-    const done = await pollUntil(ep.status, jobId);
+    // Otherwise, also queue the polling phase so we don't hog threads
+    const done = await enqueue(() => pollUntil(ep.status, jobId));
     return res.json({
       success: true,
-      provider: model === "veo" ? `kie.veo3.${tier}` : "kie.runway",
+      provider: ep.tag,
       video_url: done.output.video_url,
       job_id: jobId,
       meta: done,
-      request_id
+      request_id,
+      queue: stats()
     });
   } catch (err) {
     console.error(`[${request_id}] GENERATE ERROR:`, err.status || "", err.message);
-    res.status(err.status || 500).json({ success:false, error: err.message, request_id, meta: err.meta });
-  }
-});
-
-// ---------- Legacy convenience routes (still available)
-app.post("/generate-fast", (req, res)=> { req.body.model="veo"; req.body.tier="fast"; return app._router.handle(req,res,()=>{}); });
-app.post("/generate-quality", (req, res)=> { req.body.model="veo"; req.body.tier="quality"; return app._router.handle(req,res,()=>{}); });
-app.post("/generate-runway", (req, res)=> { req.body.model="runway"; return app._router.handle(req,res,()=>{}); });
-
-// ---------- Status proxy (useful for jobs with callback_url)
-app.get("/status/:id", async (req, res) => {
-  const request_id = rid();
-  try {
-    const model = (req.query.model || "veo").toString();
-    const ep = endpoints({ model, tier:"fast" }); // tier not needed for status
-    const data = await kieGet(ep.status, { id: req.params.id });
-    res.json({ success:true, request_id, model, data });
-  } catch (err) {
-    console.error(`[${request_id}] STATUS ERROR:`, err.status || "", err.message);
     res.status(err.status || 500).json({ success:false, error: err.message, request_id });
   }
 });
 
-// ---------- Webhook receiver (KIE → you). Optional: protect with a secret.
+// ---------------- convenience routes (still work; also queued)
+app.post("/generate-fast",  (req,res)=>{ req.body.model="veo";    req.body.tier="fast";    app._router.handle(req,res,()=>{}); });
+app.post("/generate-quality",(req,res)=>{ req.body.model="veo";    req.body.tier="quality"; app._router.handle(req,res,()=>{}); });
+app.post("/generate-runway",(req,res)=>{ req.body.model="runway";                       app._router.handle(req,res,()=>{}); });
+
+// ---------------- webhook receiver (KIE → you)
 app.post("/webhook/kie", (req, res) => {
-  // Expect body from KIE like: { id, status, output:{ video_url }, ... }
-  // Store to DB / trigger your pipeline here.
   console.log("Webhook KIE:", req.body?.id, req.body?.status, req.body?.output?.video_url || "");
   res.json({ ok: true });
 });
 
-app.listen(PORT, () => console.log(`🚀 Kie backend (LIVE) on ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Kie backend (LIVE) on ${PORT} | CONCURRENCY=${MAX}`));
