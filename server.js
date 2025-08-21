@@ -1,4 +1,4 @@
-// server.js — KIE-only backend with enforced CONCURRENCY queue
+// server.js — KIE-only backend with pass-through of optional fields
 // ENV: KIE_KEY, KIE_API_PREFIX (default https://api.kie.ai/api/v1), PORT, CORS_ORIGIN, CONCURRENCY
 
 import express from "express";
@@ -14,11 +14,11 @@ const API = (process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1").replace(
 const KEY = process.env.KIE_KEY;
 const ORIGIN = process.env.CORS_ORIGIN || "*";
 
-// ---------------- middleware
+// ---------- middleware
 app.use(cors({ origin: ORIGIN, credentials: false }));
 app.use(express.json({ limit: "2mb" }));
 
-// ---------------- simple rate guard (optional)
+// ---------- minimal rate guard
 const BUCKET = new Map();
 app.use((req,res,next)=>{
   const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip || "local";
@@ -31,54 +31,42 @@ app.use((req,res,next)=>{
   next();
 });
 
-// ---------------- health
 app.get("/", (_req, res) =>
-  res.json({ status: "✅ Kie.ai backend running", version: "2.2.0", time: new Date().toISOString() })
+  res.json({ status: "✅ Kie.ai backend running", version: "2.3.0", time: new Date().toISOString() })
 );
 app.get("/health", (_req, res) =>
   res.json({ ok: true, service: "kie-backend", api_prefix: API, kie_key_present: Boolean(KEY) })
 );
 
-// ---------------- CONCURRENCY QUEUE (this is the limiter)
+// ---------- CONCURRENCY QUEUE (unchanged)
 const MAX = Math.max(1, Number(process.env.CONCURRENCY || 2));
 let active = 0;
-const queue = []; // FIFO of { run, resolve, reject, id }
-
-function stats() { return { max: MAX, active, queued: queue.length }; }
+const queue = [];
+const stats = () => ({ max: MAX, active, queued: queue.length });
 app.get("/stats", (_req,res)=> res.json({ ok:true, ...stats() }));
-
 function enqueue(run) {
-  const id = crypto.randomBytes(6).toString("hex");
-  return new Promise((resolve, reject) => {
-    queue.push({ run, resolve, reject, id });
-    tick();
-  });
+  return new Promise((resolve, reject) => { queue.push({ run, resolve, reject }); tick(); });
 }
 async function tick() {
   if (active >= MAX) return;
   const next = queue.shift();
   if (!next) return;
   active++;
-  try {
-    const out = await next.run();
-    next.resolve(out);
-  } catch (e) {
-    next.reject(e);
-  } finally {
-    active--;
-    setImmediate(tick);
-  }
+  try { next.resolve(await next.run()); }
+  catch (e) { next.reject(e); }
+  finally { active--; setImmediate(tick); }
 }
 
-// ---------------- helpers
+// ---------- helpers
 const ALLOWED_RATIOS = new Set(["16:9", "9:16", "1:1", "4:3", "3:4"]);
+const ALLOWED_RES = new Set(["720p", "1080p"]); // extend if your KIE plan supports more
 const clamp = d => { const n=Number(d); if(!Number.isFinite(n)) return 8; return Math.max(1, Math.min(8, Math.round(n*10)/10)); };
-const rid = () => crypto.randomBytes(6).toString("hex");
 
 function sanitize(body = {}) {
-  const { prompt, duration, fps, aspect_ratio, seed, with_audio } = body;
+  const { prompt, duration, fps, aspect_ratio, seed, with_audio, resolution, style, negative_prompt } = body;
   if (!prompt || !String(prompt).trim()) { const e=new Error("Prompt is required."); e.status=400; throw e; }
-  return {
+
+  const out = {
     prompt: String(prompt),
     duration: clamp(duration ?? 8),
     fps: Number.isFinite(Number(fps)) ? Number(fps) : 30,
@@ -86,6 +74,12 @@ function sanitize(body = {}) {
     seed: seed ?? 42101,
     with_audio: with_audio === false ? false : true
   };
+
+  if (resolution && ALLOWED_RES.has(String(resolution))) out.resolution = String(resolution);
+  if (style && String(style).trim()) out.style = String(style).trim();
+  if (negative_prompt && String(negative_prompt).trim()) out.negative_prompt = String(negative_prompt).trim();
+
+  return out;
 }
 
 async function kiePost(path, payload){
@@ -120,26 +114,22 @@ function endpoints(model="veo", tier="fast"){
   const e=new Error('Invalid model. Use "veo" or "runway".'); e.status=400; throw e;
 }
 
-// ---------------- unified generate (queued; respects CONCURRENCY)
+// ---------- unified generate (queued; respects CONCURRENCY; pass-through extras)
 app.post("/generate", async (req, res) => {
-  const request_id = rid();
+  const request_id = crypto.randomBytes(6).toString("hex");
   try {
     const { model="veo", tier="fast", callback_url } = req.body || {};
     const p = sanitize(req.body);
     const ep = endpoints(model, tier);
 
-    // Enqueue the submission so only MAX jobs enter KIE at once
     const sub = await enqueue(() => kiePost(ep.submit, { ...ep.payload, ...p, ...(callback_url ? { callback_url } : {}) }));
-
     const jobId = sub.id || sub.job_id;
     if (!jobId) return res.status(502).json({ success:false, error:"No job id from KIE", raw: sub, request_id });
 
-    // If webhook callback provided, return immediately after submission
     if (callback_url) {
       return res.json({ success:true, enqueued:true, job_id: jobId, model, tier, request_id, queue: stats() });
     }
 
-    // Otherwise, also queue the polling phase so we don't hog threads
     const done = await enqueue(() => pollUntil(ep.status, jobId));
     return res.json({
       success: true,
@@ -156,12 +146,11 @@ app.post("/generate", async (req, res) => {
   }
 });
 
-// ---------------- convenience routes (still work; also queued)
+// convenience shims
 app.post("/generate-fast",  (req,res)=>{ req.body.model="veo";    req.body.tier="fast";    app._router.handle(req,res,()=>{}); });
 app.post("/generate-quality",(req,res)=>{ req.body.model="veo";    req.body.tier="quality"; app._router.handle(req,res,()=>{}); });
 app.post("/generate-runway",(req,res)=>{ req.body.model="runway";                       app._router.handle(req,res,()=>{}); });
 
-// ---------------- webhook receiver (KIE → you)
 app.post("/webhook/kie", (req, res) => {
   console.log("Webhook KIE:", req.body?.id, req.body?.status, req.body?.output?.video_url || "");
   res.json({ ok: true });
