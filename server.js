@@ -1,9 +1,9 @@
-// server.js — KIE-only backend (Railway-safe, limiter OFF by default)
+// server.js — KIE-only backend (taskId fix, Railway-safe)
 // ENV: KIE_KEY (required)
 //      KIE_API_PREFIX? (default https://api.kie.ai/api/v1)
 //      CORS_ORIGIN? (default *)
 //      CONCURRENCY? (default 2)
-//      RATE_LIMIT_MAX? (0 = disabled)  RATE_LIMIT_WINDOW_MS? (default 60000)
+//      RATE_LIMIT_MAX? (0 = disabled), RATE_LIMIT_WINDOW_MS? (default 60000)
 
 import express from "express";
 import cors from "cors";
@@ -19,30 +19,28 @@ const API  = (process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1").replace
 const KEY  = process.env.KIE_KEY;
 const ORIGIN = process.env.CORS_ORIGIN || "*";
 
-// ---------------- core middleware
+// ---------------- middleware
 app.use(cors({ origin: ORIGIN }));
 app.use(express.json({ limit: "2mb" }));
 
-// ---------------- configurable rate guard (OFF by default)
-const RATE_WINDOW = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000); // 60s
-const RATE_MAX    = Number(process.env.RATE_LIMIT_MAX || 0);           // 0 means disabled
+// ---------------- (optional) rate guard — OFF by default
+const RATE_WINDOW = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
+const RATE_MAX    = Number(process.env.RATE_LIMIT_MAX || 0);
 const RL_BUCKET = new Map();
 app.use((req,res,next)=>{
-  if (!RATE_MAX || RATE_MAX <= 0) return next(); // disabled
+  if (!RATE_MAX || RATE_MAX <= 0) return next();
   const ip  = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip || "local";
   const now = Date.now();
   const arr = (RL_BUCKET.get(ip) || []).filter(ts => now - ts < RATE_WINDOW);
   arr.push(now);
   RL_BUCKET.set(ip, arr);
-  if (arr.length > RATE_MAX) {
-    return res.status(429).json({ success:false, error:"Rate limit exceeded", limit: RATE_MAX, window_ms: RATE_WINDOW });
-  }
+  if (arr.length > RATE_MAX) return res.status(429).json({ success:false, error:"Rate limit exceeded" });
   next();
 });
 
 // ---------------- health
-app.get("/", (_req, res) => res.json({ status: "✅ Kie.ai backend running", version: "2.4.0", time: new Date().toISOString() }));
-app.get("/health", (_req,res) => res.json({ ok:true, service:"kie-backend", api_prefix: API, kie_key_present: Boolean(KEY) }));
+app.get("/", (_req, res) => res.json({ status:"✅ Kie.ai backend running", version:"2.5.0", time:new Date().toISOString() }));
+app.get("/health", (_req,res) => res.json({ ok:true, service:"kie-backend", api_prefix: API, kie_key_present:Boolean(KEY) }));
 
 // ---------------- concurrency queue
 const MAX = Math.max(1, Number(process.env.CONCURRENCY || 2));
@@ -50,10 +48,8 @@ let active = 0;
 const queue = [];
 const stats = () => ({ max: MAX, active, queued: queue.length });
 app.get("/stats", (_req,res)=> res.json({ ok:true, ...stats() }));
-function enqueue(run) {
-  return new Promise((resolve, reject) => { queue.push({ run, resolve, reject }); tick(); });
-}
-async function tick() {
+function enqueue(run){ return new Promise((resolve, reject)=>{ queue.push({ run, resolve, reject }); tick(); }); }
+async function tick(){
   if (active >= MAX) return;
   const next = queue.shift();
   if (!next) return;
@@ -65,7 +61,7 @@ async function tick() {
 
 // ---------------- helpers
 const ALLOWED_RATIOS = new Set(["16:9", "9:16", "1:1", "4:3", "3:4"]);
-const ALLOWED_RES    = new Set(["720p", "1080p"]); // extend if your KIE plan supports more
+const ALLOWED_RES    = new Set(["720p", "1080p"]); // extend if plan supports more
 const clamp = d => { const n = Number(d); if(!Number.isFinite(n)) return 8; return Math.max(1, Math.min(8, Math.round(n*10)/10)); };
 
 function sanitize(body = {}) {
@@ -88,31 +84,60 @@ function sanitize(body = {}) {
 async function kiePost(path, payload){
   if (!KEY) { const e=new Error("Missing KIE_KEY"); e.status=500; throw e; }
   const url = `${API}${path}`;
-  const { data } = await axios.post(url, payload, {
-    headers: { Authorization: `Bearer ${KEY}`, "Content-Type": "application/json" },
-    timeout: 600_000
-  });
-  return data;
+  try {
+    const { data } = await axios.post(url, payload, {
+      headers: { Authorization: `Bearer ${KEY}`, "Content-Type": "application/json" },
+      timeout: 600_000
+    });
+    return data;
+  } catch (err) {
+    const body = err.response?.data;
+    const status = err.response?.status || 502;
+    const e = new Error(`KIE POST ${status}: ${typeof body==="string" ? body : JSON.stringify(body)}`);
+    e.status = status; e.meta = body; throw e;
+  }
 }
 async function kieGet(path, params){
   const url = `${API}${path}`;
-  const { data } = await axios.get(url, {
-    params, headers: { Authorization: `Bearer ${KEY}` }, timeout: 60_000
-  });
-  return data;
+  try {
+    const { data } = await axios.get(url, {
+      params, headers: { Authorization: `Bearer ${KEY}` }, timeout: 60_000
+    });
+    return data;
+  } catch (err) {
+    const body = err.response?.data;
+    const status = err.response?.status || 502;
+    const e = new Error(`KIE GET ${status}: ${typeof body==="string" ? body : JSON.stringify(body)}`);
+    e.status = status; e.meta = body; throw e;
+  }
 }
-async function pollUntil(path, id){
+
+// ---- IMPORTANT: KIE returns taskId, and the status endpoint expects taskId
+function pickJobId(sub){
+  return (
+    sub?.data?.taskId ||    // primary KIE shape
+    sub?.taskId ||
+    sub?.id ||              // fallbacks for variant shapes
+    sub?.job_id ||
+    sub?.result?.taskId ||
+    null
+  );
+}
+
+async function pollUntilStatus(statusPath, taskId){
   for (let i=0;i<120;i++){
     await new Promise(r=>setTimeout(r, 3000));
-    const data = await kieGet(path, { id });
-    if (data.status === "succeeded" && data.output?.video_url) return data;
-    if (data.status === "failed") { const e=new Error(data.error || "Render failed"); e.status=502; e.meta=data; throw e; }
+    // NOTE: pass taskId, not id
+    const data = await kieGet(statusPath, { taskId });
+    // Typical success shape: { status:"succeeded", output:{ video_url:"..." } }
+    if (data?.status === "succeeded" && data?.output?.video_url) return data;
+    if (data?.status === "failed") { const e=new Error(data.error || "Render failed"); e.status=502; e.meta=data; throw e; }
   }
   const e=new Error("Render timeout"); e.status=504; throw e;
 }
 
 function resolveEndpoints(model="veo", tier="fast"){
-  if (model === "veo")    return { submit:"/veo/generate",    status:"/veo/record-info",    payload:{ mode: tier==="quality" ? "quality" : "fast" }, tag:`kie.veo3.${tier}` };
+  if (model === "veo")    return { submit:"/veo/generate",    status:"/veo/record-info", payload:{ mode: tier==="quality" ? "quality" : "fast" }, tag:`kie.veo3.${tier}` };
   if (model === "runway") return { submit:"/runway/generate", status:"/runway/record-info", payload:{}, tag:"kie.runway" };
   const e=new Error('Invalid model. Use "veo" or "runway".'); e.status=400; throw e;
 }
@@ -125,17 +150,39 @@ async function handleGenerate(req, res) {
     const p  = sanitize(req.body);
     const ep = resolveEndpoints(model, tier);
 
-    // submit
+    // Submit (queued for concurrency)
     const sub = await enqueue(() => kiePost(ep.submit, { ...ep.payload, ...p, ...(callback_url ? { callback_url } : {}) }));
-    const jobId = sub.id || sub.job_id;
-    if (!jobId) return res.status(502).json({ success:false, error:"No job id from KIE", raw: sub, request_id });
 
-    // async path
-    if (callback_url) return res.json({ success:true, enqueued:true, job_id: jobId, model, tier, request_id, queue: stats() });
+    // Log first 1.2KB of submit once; useful for diagnosing shapes (remove later if noisy)
+    try { console.log(`[submit:${ep.submit}]`, JSON.stringify(sub).slice(0, 1200)); } catch {}
 
-    // sync poll
-    const done = await enqueue(() => pollUntil(ep.status, jobId));
-    return res.json({ success:true, provider: ep.tag, video_url: done.output.video_url, job_id: jobId, meta: done, request_id, queue: stats() });
+    // Pull taskId in all known shapes
+    const jobId = pickJobId(sub);
+    if (!jobId) {
+      return res.status(502).json({
+        success:false,
+        error:"No job id from KIE",
+        submit_endpoint: ep.submit,
+        raw_submit: sub,
+        request_id
+      });
+    }
+
+    if (callback_url) {
+      return res.json({ success:true, enqueued:true, job_id: jobId, model, tier, request_id, queue: stats() });
+    }
+
+    // Poll (queued) — pass taskId, not id
+    const done = await enqueue(() => pollUntilStatus(ep.status, jobId));
+    return res.json({
+      success: true,
+      provider: ep.tag,
+      video_url: done.output.video_url,
+      job_id: jobId,
+      meta: done,
+      request_id,
+      queue: stats()
+    });
   } catch (err) {
     console.error(`[${request_id}] GENERATE ERROR:`, err.status || "", err.message);
     res.status(err.status || 500).json({ success:false, error: err.message, request_id });
