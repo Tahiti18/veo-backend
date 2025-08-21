@@ -1,9 +1,9 @@
-// server.js — KIE-only, taskId-safe, fast boot
+// server.js — KIE-only backend (taskId-safe, fast boot, dual-auth, veo→veo3 fallback)
 // ENV: KIE_KEY (required)
-//      KIE_API_PREFIX (optional, default https://api.kie.ai/api/v1)
-//      CORS_ORIGIN (optional, default *)
-//      PORT (optional, default 8080)
-//      CONCURRENCY (optional, default 1)
+//      KIE_API_PREFIX? (default https://api.kie.ai/api/v1)
+//      CORS_ORIGIN? (default *)
+//      PORT? (default 8080)
+//      CONCURRENCY? (default 1)
 
 import express from "express";
 import cors from "cors";
@@ -18,7 +18,7 @@ const PORT  = process.env.PORT || 8080;
 const ORIG  = process.env.CORS_ORIGIN || "*";
 const API   = (process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1").replace(/\/+$/,"");
 const KEY   = process.env.KIE_KEY;
-const MAX   = Math.max(1, Number(process.env.CONCURRENCY || 1)); // keep simple & safe
+const MAX   = Math.max(1, Number(process.env.CONCURRENCY || 1)); // simple & safe
 
 app.use(cors({ origin: ORIG }));
 app.use(express.json({ limit: "1mb" }));
@@ -58,27 +58,30 @@ function sanitize(b={}){
   return out;
 }
 
-// ---------- KIE helpers (taskId aware)
+// ---------- KIE helpers (dual-auth, taskId aware)
 async function kiePost(path, payload){
   if(!KEY){ const e=new Error("Missing KIE_KEY"); e.status=500; throw e; }
   const url = `${API}${path}`;
-  const { data } = await axios.post(url, payload, {
-    headers: { Authorization: `Bearer ${KEY}`, "Content-Type":"application/json" },
-    timeout: 600_000
-  });
+  // send BOTH auth styles (some tenants require x-api-key)
+  const headers = {
+    Authorization: `Bearer ${KEY}`,
+    "x-api-key": KEY,
+    "Content-Type":"application/json"
+  };
+  const { data } = await axios.post(url, payload, { headers, timeout: 600_000 });
   return data;
 }
 async function kieGet(path, params){
   const url = `${API}${path}`;
-  const { data } = await axios.get(url, {
-    params, headers: { Authorization: `Bearer ${KEY}` }, timeout: 60_000
-  });
+  const headers = { Authorization: `Bearer ${KEY}`, "x-api-key": KEY };
+  const { data } = await axios.get(url, { params, headers, timeout: 60_000 });
   return data;
 }
 function pickTaskId(sub){
   return (
     sub?.data?.taskId ||
     sub?.taskId ||
+    sub?.data?.id ||
     sub?.id ||
     sub?.job_id ||
     sub?.result?.taskId ||
@@ -86,16 +89,21 @@ function pickTaskId(sub){
   );
 }
 async function pollTask(statusPath, taskId){
+  const tryOnce = async (path) => kieGet(path, { taskId });
   for(let i=0;i<120;i++){
     await new Promise(r=>setTimeout(r, 3000));
-    const st = await kieGet(statusPath, { taskId }); // <-- IMPORTANT
+    let st = await tryOnce(statusPath);
+    if (!st?.status && /\/veo\//.test(statusPath)) {
+      // fallback to /veo3/ status if legacy path returned an odd shape
+      st = await tryOnce(statusPath.replace("/veo/", "/veo3/"));
+    }
     if(st?.status === "succeeded" && st?.output?.video_url) return st;
     if(st?.status === "failed"){ const e=new Error(st.error || "Render failed"); e.status=502; e.meta=st; throw e; }
   }
   const e=new Error("Render timeout"); e.status=504; throw e;
 }
 
-// ---------- endpoints map
+// ---------- endpoints (veo with auto-fallback to veo3)
 function endpoints(tier="fast"){
   return {
     submit: "/veo/generate",
@@ -105,7 +113,7 @@ function endpoints(tier="fast"){
   };
 }
 
-// ---------- single handler
+// ---------- single handler with veo→veo3 fallback
 async function handleGenerate(req,res){
   const reqId = crypto.randomBytes(5).toString("hex");
   try{
@@ -113,17 +121,33 @@ async function handleGenerate(req,res){
     const ep = endpoints(tier);
     const body = sanitize(req.body);
 
-    const submit = await enqueue(() => kiePost(ep.submit, { ...ep.payload, ...body, ...(callback_url ? { callback_url } : {}) }));
-    const taskId = pickTaskId(submit);
+    // 1) Try legacy /veo/*
+    let submit = await enqueue(() => kiePost(ep.submit, { ...ep.payload, ...body, ...(callback_url ? { callback_url } : {}) }));
+    let taskId = pickTaskId(submit);
+
+    // 2) If no taskId, retry with /veo3/*
     if(!taskId){
-      return res.status(502).json({ success:false, error:"No job id from KIE", raw_submit: submit, request_id: reqId });
+      const submitV3 = ep.submit.replace("/veo/", "/veo3/");
+      submit = await enqueue(() => kiePost(submitV3, { ...ep.payload, ...body, ...(callback_url ? { callback_url } : {}) }));
+      taskId = pickTaskId(submit);
+    }
+
+    if(!taskId){
+      return res.status(502).json({
+        success:false,
+        error:"No job id from KIE",
+        tried: { primary: ep.submit, fallback: ep.submit.replace("/veo/", "/veo3/") },
+        raw_submit: submit,
+        request_id: reqId
+      });
     }
 
     if(callback_url){
       return res.json({ success:true, enqueued:true, job_id:taskId, tier, request_id:reqId });
     }
 
-    const done = await enqueue(() => pollTask(ep.status, taskId));
+    const statusPath = ep.status; // poll will auto-fallback to /veo3/ if needed
+    const done = await enqueue(() => pollTask(statusPath, taskId));
     return res.json({ success:true, provider:ep.tag, job_id:taskId, video_url:done.output.video_url, meta:done, request_id:reqId });
   }catch(err){
     console.error(`[GEN ${reqId}]`, err.status||"", err.message);
@@ -135,7 +159,7 @@ async function handleGenerate(req,res){
 app.post("/generate-fast",    (req,res)=>{ req.body = { ...req.body, tier:"fast"    }; handleGenerate(req,res); });
 app.post("/generate-quality", (req,res)=>{ req.body = { ...req.body, tier:"quality" }; handleGenerate(req,res); });
 
-// debug (no credits)
+// ---------- debug (no credits)
 app.post("/debug/sanitize", (req,res)=>{
   try{ res.json({ ok:true, payload: sanitize(req.body) }); }
   catch(e){ res.status(e.status||400).json({ ok:false, error:e.message }); }
