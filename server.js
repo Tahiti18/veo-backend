@@ -1,37 +1,31 @@
-// server.js — KIE backend with working routes + preflight + multi-path submit/poll
-// ENV: KIE_KEY (required); optional KIE_API_PREFIX (default https://api.kie.ai/api/v1), CORS_ORIGIN, PORT, CONCURRENCY
-
+// server.js — KIE backend with routes + preflight + multi-path submit/poll
 import express from "express";
 import cors from "cors";
 import axios from "axios";
-import dotenv from "dotenv";
 import crypto from "crypto";
-dotenv.config();
 
 const app   = express();
 const PORT  = process.env.PORT || 8080;
 const ORIG  = process.env.CORS_ORIGIN || "*";
-const API   = (process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1").replace(/\/+$/,"");
-const KEY   = process.env.KIE_KEY;
-const MAX   = Math.max(1, Number(process.env.CONCURRENCY || 1));
+
+// >>> hardcoded values <<<
+const API   = "https://api.kie.ai/api/v1";
+const KEY   = "sk-f633bdc7-9ff5-45d0-9479-91f6c87b8fd3";   // your actual KIE key
+const MAX   = 1;
 
 app.use(cors({ origin: ORIG }));
 app.use(express.json({ limit: "2mb" }));
 
-// ------- health
 app.get("/", (_req,res)=> res.json({ ok:true, service:"kie-backend", time:new Date().toISOString() }));
 app.get("/health", (_req,res)=> res.json({ ok:true, api_prefix: API, kie_key_present: !!KEY }));
 
-// ------- CORS preflight (important: avoids 404 on OPTIONS)
 app.options("/generate-fast", cors());
 app.options("/generate-quality", cors());
 
-// ------- tiny queue
 let active=0; const q=[];
 function enqueue(run){ return new Promise((resolve,reject)=>{ q.push({run,resolve,reject}); pump(); }); }
 async function pump(){ if(active>=MAX||!q.length) return; active++; const j=q.shift(); try{ j.resolve(await j.run()); }catch(e){ j.reject(e); }finally{ active--; setImmediate(pump); } }
 
-// ------- input guard
 const RATIOS = new Set(["16:9","9:16","1:1","4:3","3:4"]);
 const RES    = new Set(["720p","1080p"]);
 const clamp  = s => Math.max(1, Math.min(8, Math.round(Number(s||8)*10)/10));
@@ -52,9 +46,7 @@ function sanitize(b={}){
   return out;
 }
 
-// ------- KIE helpers
 function authHeaders(){
-  if(!KEY){ const e=new Error("Missing KIE_KEY"); e.status=500; throw e; }
   return { Authorization: `Bearer ${KEY}`, "x-api-key": KEY, "Content-Type":"application/json" };
 }
 async function kiePost(path, payload){
@@ -104,7 +96,6 @@ async function pollAny(taskId){
   const e=new Error("Render timeout"); e.status=504; throw e;
 }
 
-// ------- unified handler
 async function handleGenerate(req,res){
   const reqId = crypto.randomBytes(5).toString("hex");
   try{
@@ -123,7 +114,6 @@ async function handleGenerate(req,res){
   }
 }
 
-// ------- routes your UI calls
 app.post("/generate-fast",(req,res)=>{ req.body={...req.body,tier:"fast"};    handleGenerate(req,res); });
 app.post("/generate-quality",(req,res)=>{ req.body={...req.body,tier:"quality"}; handleGenerate(req,res); });
 
