@@ -1,50 +1,65 @@
-// server.js — KIE backend (fixed endpoints) + browser diagnostics
-// ENV: KIE_KEY (required), KIE_API_PREFIX (default https://api.kie.ai/api/v1)
-//      CORS_ORIGIN (*), PORT (8080), CONCURRENCY (1)
-// Open in browser after deploy:  /health  /stats  /diagnostics
+// server.js — adds /triage (auto-detect KIE paths) + generate endpoints
+// ENV needed in Railway Variables:
+//   KIE_KEY
+// Optional:
+//   KIE_API_PREFIX="https://api.kie.ai/api/v1"
+//   CORS_ORIGIN="*"
+//   PORT="8080"
+//   CONCURRENCY="1"
 
 import express from "express";
 import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
 import crypto from "crypto";
-
 dotenv.config();
 
-const app   = express();
-const PORT  = process.env.PORT || 8080;
-const ORIG  = process.env.CORS_ORIGIN || "*";
-const API   = (process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1").replace(/\/+$/,"");
-const KEY   = process.env.KIE_KEY;
-const MAX   = Math.max(1, Number(process.env.CONCURRENCY || 1));
+const app  = express();
+const PORT = process.env.PORT || 8080;
+const ORIG = process.env.CORS_ORIGIN || "*";
+const API  = (process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1").replace(/\/+$/,"");
+const KEY  = process.env.KIE_KEY;
+const MAX  = Math.max(1, Number(process.env.CONCURRENCY || 1));
 
 app.use(cors({ origin: ORIG }));
 app.use(express.json({ limit: "2mb" }));
 
-// ---------- health / stats
-const started = Date.now();
+// ---------- small queue (keeps within concurrency) ----------
 let active = 0; const queue = [];
+function enqueue(run){ return new Promise((resolve,reject)=>{ queue.push({run,resolve,reject}); pump(); }); }
+async function pump(){ if(active>=MAX || !queue.length) return; active++; const j=queue.shift(); try{ j.resolve(await j.run()); }catch(e){ j.reject(e); }finally{ active--; setImmediate(pump); } }
+
+// ---------- health ----------
+const boot = Date.now();
 app.get("/", (_req,res)=> res.json({ ok:true, service:"kie-backend", time:new Date().toISOString() }));
 app.get("/health", (_req,res)=> res.json({ ok:true, api_prefix: API, kie_key_present: !!KEY }));
 app.get("/stats", (_req,res)=> res.json({
   ok:true, service:"kie-backend",
-  uptime_sec: Math.floor((Date.now()-started)/1000),
+  uptime_sec: Math.floor((Date.now()-boot)/1000),
   active, queued: queue.length, max_concurrency: MAX,
   api_prefix: API, key_present: !!KEY
 }));
 
-// ---------- tiny queue
-function enqueue(run){ return new Promise((resolve,reject)=>{ queue.push({run,resolve,reject}); pump(); }); }
-async function pump(){
-  if(active>=MAX || !queue.length) return;
-  active++;
-  const job = queue.shift();
-  try{ job.resolve(await job.run()); }
-  catch(e){ job.reject(e); }
-  finally{ active--; setImmediate(pump); }
+// ---------- helpers ----------
+function headers(){
+  // try both Authorization and x-api-key (some stacks use either)
+  return { Authorization:`Bearer ${KEY}`, "x-api-key": KEY, "Content-Type":"application/json" };
+}
+async function kiePost(path, payload){
+  const url = `${API}${path}`;
+  const { data } = await axios.post(url, payload, { headers: headers(), timeout: 600_000 });
+  return data;
+}
+async function kieGet(path, params){
+  const url = `${API}${path}`;
+  const { data } = await axios.get(url, { params, headers: headers(), timeout: 60_000 });
+  return data;
+}
+function pickTaskId(x){
+  return x?.taskId || x?.data?.taskId || x?.id || x?.data?.id || x?.job_id || x?.result?.taskId || null;
 }
 
-// ---------- input guard
+// ---------- sanitize inputs ----------
 const RATIOS = new Set(["16:9","9:16","1:1","4:3","3:4"]);
 const RES    = new Set(["720p","1080p"]);
 const clamp  = s => Math.max(1, Math.min(8, Math.round(Number(s||8)*10)/10));
@@ -57,129 +72,140 @@ function sanitize(b={}){
     aspect_ratio: RATIOS.has(String(aspect_ratio)) ? String(aspect_ratio) : "9:16",
     with_audio: (with_audio!==undefined ? with_audio : audio)!==false
   };
-  if (resolution && RES.has(String(resolution))) out.resolution = String(resolution);
-  if (style && String(style).trim()) out.style = String(style).trim();
-  if (negative_prompt && String(negative_prompt).trim()) out.negative_prompt = String(negative_prompt).trim();
-  if (seed !== undefined) out.seed = seed;
+  if(resolution && RES.has(String(resolution))) out.resolution = String(resolution);
+  if(style && String(style).trim()) out.style = String(style).trim();
+  if(negative_prompt && String(negative_prompt).trim()) out.negative_prompt = String(negative_prompt).trim();
+  if(seed !== undefined) out.seed = seed;
   return out;
 }
 
-// ---------- KIE helpers
-const H = { get Authorization(){ return `Bearer ${KEY}`; }, "x-api-key": KEY, "Content-Type":"application/json" };
-async function kiePost(path, payload){
-  if(!KEY){ const e=new Error("Missing KIE_KEY"); e.status=500; throw e; }
-  const url = `${API}${path}`;
-  const { data } = await axios.post(url, payload, { headers: H, timeout: 600_000 });
-  return data;
-}
-async function kieGetPath(pathWithId){
-  if(!KEY){ const e=new Error("Missing KIE_KEY"); e.status=500; throw e; }
-  const url = `${API}${pathWithId}`;
-  const { data } = await axios.get(url, { headers: H, timeout: 60_000 });
-  return data;
-}
-function pickTaskId(sub){
-  return sub?.id || sub?.taskId || sub?.data?.id || sub?.data?.taskId || sub?.job_id || null;
-}
+// ---------- path auto-detect (cached after first success) ----------
+let DETECT = { submit_path:null, status_path:null, last_err:null };
 
-// ---------- definitive endpoints (corrected)
-const SUBMIT_PATH = "/video/generations";          // POST
-const STATUS_PATH = "/video/generations";          // GET /video/generations/:id
-// keep one legacy fallback that sometimes answers (422 without model)
-const FALLBACK_SUBMIT = "/veo/generate";
+const SUBMIT_CANDIDATES = [
+  "/veo/generate",
+  "/veo3/generate",
+  "/video/generate",
+  "/video/generations",   // your screenshot showed 404 here → close but not it
+  "/videos/generate",
+  "/jobs/create"
+];
 
-// submit -> returns task id
-async function submitToKIE(payload){
-  let lastErr;
-  // try correct endpoint first
-  for(const path of [SUBMIT_PATH, FALLBACK_SUBMIT]){
+const STATUS_CANDIDATES = [
+  "/veo/record-info",
+  "/veo3/record-info",
+  "/video/status",
+  "/videos/status",
+  "/job/status",
+  "/jobs/status"
+];
+
+// Tries all submit paths until one returns a recognizable id (no console needed)
+async function detectPaths(){
+  const probeBody = { model:"veo-3", mode:"fast", prompt:"probe", duration:1, aspect_ratio:"9:16", with_audio:false };
+
+  // find submit
+  let submit_path = null; let last = null;
+  for(const p of SUBMIT_CANDIDATES){
     try{
-      const resp = await enqueue(()=> kiePost(path, payload));
-      const id = pickTaskId(resp);
-      if(id) return { id, submitPath: path, raw: resp };
-      lastErr = new Error(`No taskId from ${path}`); lastErr.raw = resp;
-    }catch(e){ lastErr = e; }
+      const data = await enqueue(()=> kiePost(p, probeBody));
+      const id = pickTaskId(data);
+      if(id){ submit_path = p; last = { ok:true, id }; break; }
+      last = { ok:false, err:"no taskId", raw: data };
+    }catch(e){ last = { ok:false, err: e?.response?.status || e.message }; }
   }
-  throw lastErr || new Error("Submit failed");
+  if(!submit_path){ DETECT = { submit_path:null, status_path:null, last_err:last }; return DETECT; }
+
+  // find status that can read that id (try all with different param names)
+  let status_path = null;
+  const idForStatus = last.id || "dummy"; // if provider starts job only on correct payload, we still try paths
+  const paramVariants = [ { taskId:idForStatus }, { id:idForStatus }, { task_id:idForStatus }, { job_id:idForStatus } ];
+  for(const sp of STATUS_CANDIDATES){
+    for(const pv of paramVariants){
+      try{
+        await enqueue(()=> kieGet(sp, pv));
+        status_path = sp; break;
+      }catch{/* continue */}
+    }
+    if(status_path) break;
+  }
+
+  DETECT = { submit_path, status_path, last_err:null };
+  return DETECT;
 }
 
-// poll by PATH PARAM (/video/generations/:id)
-async function pollUntil(id){
-  for(let i=0;i<120;i++){
-    await new Promise(r=>setTimeout(r, 3000));
-    try{
-      const st = await kieGetPath(`${STATUS_PATH}/${id}`);
-      if(st?.status === "succeeded" && st?.output?.video_url) return st;
-      if(st?.status === "failed"){ const e=new Error(st.error || "Render failed"); e.status=502; e.meta=st; throw e; }
-    }catch{ /* keep looping */ }
-  }
-  const e=new Error("Render timeout"); e.status=504; throw e;
-}
-
-// ---------- main handler
-async function handleGenerate(req,res){
-  const reqId = crypto.randomBytes(5).toString("hex");
-  try{
-    const tier = (req.body?.tier==="quality") ? "quality" : "fast";
-    const body = sanitize(req.body);
-
-    // include model explicitly to satisfy /veo/generate when used
-    const payload = { model: "veo-3", mode: tier, ...body };
-
-    const { id, submitPath } = await submitToKIE(payload);
-    const done = await pollUntil(id);
-
-    return res.json({
-      success:true,
-      job_id: id,
-      video_url: done.output.video_url,
-      meta: done,
-      submitPath,
-      statusPath: `${STATUS_PATH}/${id}`,
-      request_id: reqId
-    });
-  }catch(err){
-    res.status(err.status||500).json({ success:false, error:String(err.message||err), request_id:reqId });
-  }
-}
-
-// ---------- routes + preflight (iPad/Safari friendly)
-app.post("/generate-fast",    (req,res)=>{ req.body = { ...req.body, tier:"fast"    }; handleGenerate(req,res); });
-app.post("/generate-quality", (req,res)=>{ req.body = { ...req.body, tier:"quality" }; handleGenerate(req,res); });
-for (const p of ["/generate-fast","/generate-quality"]) {
-  app.options(p, (_req,res)=> res.set({
-    "Access-Control-Allow-Origin": ORIG,
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
-  }).sendStatus(204));
-}
-
-// ---------- browser diagnostics (open /diagnostics)
-app.get("/diagnostics", async (_req,res)=>{
-  const out = {
-    api: API, key_present: !!KEY,
-    submit_path: SUBMIT_PATH, status_path: STATUS_PATH,
-    probe: {}
-  };
-  if(KEY){
-    try{
-      const sample = { model:"veo-3", mode:"fast", prompt:"diagnostic test", duration:1, aspect_ratio:"9:16", with_audio:false };
-      const sub = await kiePost(SUBMIT_PATH, sample);
-      const id  = pickTaskId(sub);
-      out.probe.submit_ok = !!id;
-      out.probe.submit_raw = !!id ? undefined : sub;
-      if(id){
-        // single quick status check (no loop) just to confirm 200
-        try{
-          const st = await kieGetPath(`${STATUS_PATH}/${id}`);
-          out.probe.status_ping_ok = true;
-          out.probe.status = { id, status: st?.status || null };
-        }catch(e){ out.probe.status_ping_ok = false; out.probe.status_err = e?.response?.status || String(e); }
-      }
-    }catch(e){ out.probe.submit_ok = false; out.probe.submit_err = e?.response?.status || String(e); }
-  }
-  res.setHeader("Content-Type","application/json; charset=utf-8");
-  res.end(JSON.stringify(out, null, 2));
+// View in browser: /triage
+app.get("/triage", async (_req,res)=>{
+  if(!KEY){ return res.status(500).json({ ok:false, error:"Missing KIE_KEY" }); }
+  const detected = await detectPaths();
+  res.json({
+    api: API,
+    key_present: !!KEY,
+    detected,
+    note: detected.submit_path ? "Paths cached. Generate endpoints will use these." : "No working path found yet."
+  });
 });
+
+// ---------- generation using detected paths ----------
+async function generateHandler(req,res){
+  const request_id = crypto.randomBytes(5).toString("hex");
+  try{
+    if(!KEY){ const e=new Error("Missing KIE_KEY"); e.status=500; throw e; }
+
+    // Ensure paths detected (or re-detect if not)
+    if(!DETECT.submit_path){
+      await detectPaths();
+      if(!DETECT.submit_path){ const e=new Error("No working KIE submit path found. Open /triage first."); e.status=502; throw e; }
+    }
+
+    const tier = req.body?.tier==="quality" ? "quality" : "fast";
+    const body = sanitize(req.body);
+    const payload = { model:"veo-3", mode: tier, ...body };
+
+    // submit
+    const sub = await enqueue(()=> kiePost(DETECT.submit_path, payload));
+    const taskId = pickTaskId(sub);
+    if(!taskId){ const e=new Error("No job id from KIE"); e.status=502; e.meta=sub; throw e; }
+
+    // poll (try known status path(s) + param name variants)
+    const statusPaths = DETECT.status_path ? [DETECT.status_path] : STATUS_CANDIDATES;
+    const paramVariants = [ { taskId:taskId }, { id:taskId }, { task_id:taskId }, { job_id:taskId } ];
+
+    for(let i=0;i<120;i++){
+      await new Promise(r=>setTimeout(r, 3000));
+      for(const sp of statusPaths){
+        for(const pv of paramVariants){
+          try{
+            const st = await enqueue(()=> kieGet(sp, pv));
+            if(st?.status==="succeeded" && st?.output?.video_url){
+              return res.json({ success:true, job_id:taskId, video_url: st.output.video_url, meta: st, request_id });
+            }
+            if(st?.status==="failed"){ const e=new Error(st.error || "Render failed"); e.status=502; e.meta=st; throw e; }
+          }catch{/* keep looping */}
+        }
+      }
+    }
+    const e=new Error("Render timeout"); e.status=504; throw e;
+
+  }catch(err){
+    res.status(err.status||500).json({ success:false, error:String(err.message||err), request_id });
+  }
+}
+
+// Routes your frontend calls
+app.post("/generate-fast",    (req,res)=>{ req.body = { ...req.body, tier:"fast"    }; generateHandler(req,res); });
+app.post("/generate-quality", (req,res)=>{ req.body = { ...req.body, tier:"quality" }; generateHandler(req,res); });
+
+// CORS preflight (helps Safari/iPad)
+app.options("/generate-fast", (_req,res)=> res.set({
+  "Access-Control-Allow-Origin": ORIG,
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+}).sendStatus(204));
+app.options("/generate-quality", (_req,res)=> res.set({
+  "Access-Control-Allow-Origin": ORIG,
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+}).sendStatus(204));
 
 app.listen(PORT, ()=> console.log(`🚀 KIE backend (LIVE) on ${PORT} | CONCURRENCY=${MAX}`));
