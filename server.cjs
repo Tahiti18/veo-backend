@@ -1,66 +1,52 @@
-// --- ElevenLabs TTS (streaming, no file writes) ---
-const { Readable, pipeline } = require("stream");
-const { promisify } = require("util");
-const pipe = promisify(pipeline);
+// server.cjs — baseline + ElevenLabs voices (read-only)
+const express = require("express");
+const cors = require("cors");
 
-/**
- * POST /api/eleven/tts.stream
- * body: { voice_id, text, model_id?, params? }
- * Streams audio/mpeg back to the client. No disk I/O.
- * Optional query: ?download=1 to force attachment filename.
- */
-app.post("/api/eleven/tts.stream", async (req, res) => {
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
+
+// ---- helpers ----
+const ELEVEN_KEY = process.env.ELEVEN_LABS || process.env.ELEVENLABS_API_KEY || "";
+const withTimeout = async (promise, ms = 8000, label = "request") => {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), ms);
   try {
-    const ELEVEN_KEY = process.env.ELEVEN_LABS || process.env.ELEVENLABS_API_KEY || "";
-    if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
+    return await promise(ac.signal);
+  } finally {
+    clearTimeout(t);
+  }
+};
 
-    const { voice_id, text, model_id, params } = req.body || {};
-    if (!voice_id || !text) return res.status(400).json({ error: "voice_id and text required" });
+// ---- health + ping ----
+app.get("/ping", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+app.get("/api/health-eleven", (_req, res) => {
+  res.json({ ok: true, elevenKeyPresent: !!ELEVEN_KEY, ts: new Date().toISOString() });
+});
 
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice_id)}?optimize_streaming_latency=0`;
-    const payload = {
-      text,
-      model_id: model_id || "eleven_multilingual_v2",
-      voice_settings: {
-        stability: params?.stability ?? 0.45,
-        similarity_boost: params?.similarity_boost ?? 0.8,
-        style: params?.style ?? 0.0,
-        use_speaker_boost: params?.use_speaker_boost ?? true
-      }
-    };
-
-    const r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "xi-api-key": ELEVEN_KEY,
-        "Content-Type": "application/json",
-        "Accept": "audio/mpeg"
-      },
-      body: JSON.stringify(payload)
-    });
-
-    if (!r.ok) {
-      const errText = await r.text().catch(() => "");
-      return res.status(r.status).json({ error: "ElevenLabs error", detail: errText });
-    }
-
-    // Forward headers and stream body
-    res.setHeader("Content-Type", "audio/mpeg");
-    const len = r.headers.get("content-length");
-    if (len) res.setHeader("Content-Length", len);
-    if (String(req.query.download || "") === "1") {
-      res.setHeader("Content-Disposition", 'attachment; filename="voiceover.mp3"');
-    }
-
-    // Convert WHATWG ReadableStream -> Node stream and pipe to response
-    const nodeStream = Readable.fromWeb(r.body);
-    await pipe(nodeStream, res);
+// ---- ElevenLabs voices (read-only) ----
+app.get("/api/eleven/voices", async (_req, res) => {
+  if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing (set ELEVEN_LABS or ELEVENLABS_API_KEY)" });
+  try {
+    const r = await withTimeout(
+      (signal) => fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": ELEVEN_KEY }, signal }),
+      8000,
+      "voices"
+    );
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(r.status).json(j);
+    const voices = (j.voices || []).map(v => ({
+      id: v.voice_id || v.voiceId || v.id,
+      name: v.name,
+      category: v.category || ""
+    }));
+    res.json({ voices });
   } catch (e) {
-    // If headers already sent during streaming, just destroy the socket
-    if (!res.headersSent) {
-      res.status(500).json({ error: String(e?.message || e) });
-    } else {
-      try { res.destroy(e); } catch {}
-    }
+    const msg = e?.name === "AbortError" ? "Voices request timed out" : (e?.message || String(e));
+    res.status(502).json({ error: msg });
   }
 });
+
+// ---- start ----
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, "0.0.0.0", () => console.log(`[OK] Listening on ${PORT}`));
