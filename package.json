@@ -1,12 +1,14 @@
 {
-  "name": "veo-backend",
+  "name": "veo-backend-baseline",
   "private": true,
-  "engines": { "node": ">=18.17" },
+  "version": "1.0.0",
+  "description": "Minimal Express baseline to isolate crashes",
+  "engines": { "node": ">=20.11.0" },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.cjs"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
   }
 }
