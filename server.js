@@ -80,16 +80,16 @@ function pickTaskId(sub){
 // ---------- candidate paths (override with env if needed)
 const SUBMIT_PATHS = (process.env.KIE_SUBMIT_PATHS?.split(",").map(s=>s.trim()).filter(Boolean)) ||
 [
+  "/veo/generate",       // this one returned 422 earlier -> valid route
   "/veo3/generate",
-  "/veo/generate",
   "/video/generate",
   "/video/gen",
   "/videos/generate"
 ];
 const STATUS_PATHS = (process.env.KIE_STATUS_PATHS?.split(",").map(s=>s.trim()).filter(Boolean)) ||
 [
-  "/veo3/record-info",
   "/veo/record-info",
+  "/veo3/record-info",
   "/video/status",
   "/videos/status",
   "/job/status"
@@ -103,8 +103,7 @@ async function trySubmit(payload){
       const resp = await enqueue(()=> kiePost(p, payload));
       const taskId = pickTaskId(resp);
       if(taskId) return { taskId, submitPath: p, raw: resp };
-      lastErr = new Error(`No taskId in response for ${p}`);
-      lastErr.raw = resp;
+      lastErr = new Error(`No taskId in response for ${p}`); lastErr.raw = resp;
     }catch(e){ lastErr = e; }
   }
   throw lastErr || new Error("All submit attempts failed");
@@ -134,7 +133,9 @@ async function handleGenerate(req,res){
     if(!KEY){ const e=new Error("Missing KIE_KEY"); e.status=500; throw e; }
     const tier = (req.body?.tier==="quality") ? "quality" : "fast";
     const body = sanitize(req.body);
-    const payload = { mode: tier, ...body };
+
+    // *** CRITICAL FIX: include the model explicitly ***
+    const payload = { model: "veo-3", mode: tier, ...body };
 
     const { taskId, submitPath } = await trySubmit(payload);
     if(!taskId) return res.status(502).json({ success:false, error:"No job id from KIE", request_id:reqId });
@@ -169,15 +170,14 @@ app.options("/generate-quality", (_req,res)=> res.set({
   "Access-Control-Allow-Headers": "Content-Type"
 }).sendStatus(204));
 
-// ---------- browser diagnostics page (open /diagnostics in Safari)
+// ---------- browser diagnostics (open /diagnostics)
 app.get("/diagnostics", async (_req,res)=>{
   const result = { api: API, key_present: !!KEY, submit_paths: SUBMIT_PATHS, status_paths: STATUS_PATHS, probes: [] };
-  // probe submit paths with a dry-run prompt (short)
   if(KEY){
     for(const p of SUBMIT_PATHS){
       try{
-        const data = await kiePost(p, { mode:"fast", prompt:"diagnostic test", duration:1, aspect_ratio:"9:16", with_audio:false });
-        result.probes.push({ submit:p, taskId: pickTaskId(data) || null, ok: !!pickTaskId(data), raw: data });
+        const data = await kiePost(p, { model:"veo-3", mode:"fast", prompt:"diagnostic test", duration:1, aspect_ratio:"9:16", with_audio:false });
+        result.probes.push({ submit:p, taskId: pickTaskId(data) || null, ok: !!pickTaskId(data) });
         if (result.probes.at(-1).ok) break;
       }catch(e){ result.probes.push({ submit:p, ok:false, err: e?.response?.status || e.message }); }
     }
