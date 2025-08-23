@@ -54,7 +54,7 @@ const MUX_DIR     = path.join(STATIC_ROOT, "mux");
 (async () => { try { await fs.mkdir(TTS_DIR, { recursive: true }); await fs.mkdir(MUX_DIR, { recursive: true }); } catch (_) {} })();
 
 // ---------- Helpers ----------
-function withTimeout(fn, ms = 25000) {
+function withTimeout(fn, ms = 120000) {           // 120s default
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), ms);
   return Promise.resolve(fn(ac.signal)).finally(() => clearTimeout(t));
