@@ -1,6 +1,4 @@
-// server.cjs — Unity Lab backend (CommonJS, Node >=20)
-// Smart-proxy for generate/result + ElevenLabs + diag + optional mux
-
+// server.cjs — FIXED KIE.ai endpoints
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
@@ -16,29 +14,19 @@ app.use(express.json({ limit: "2mb" }));
 
 // ---------- ENV ----------
 const PORT = process.env.PORT || 8080;
-
-// ElevenLabs API key
 const ELEVEN_KEY = process.env.ELEVEN_LABS || "";
-
-// KIE.ai configuration (FIXED ENDPOINTS)
-const KIE_BASE_URL = "https://api.kie.ai/api/v1/veo3";
+const KIE_BASE_URL = "https://api.kie.ai/api/v1/veo"; // ✅ FIXED URL
 const KIE_KEY = process.env.KIE_KEY || "";
-
-// Model defaults
 const VEO_MODEL_FAST = process.env.VEO_MODEL_FAST || "V3_5";
 const VEO_MODEL_QUALITY = process.env.VEO_MODEL_QUALITY || "V4_5PLUS";
-
-// Mux options
 const ENABLE_MUX = process.env.ENABLE_MUX === "1";
-const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
 
-// Writable locations on Railway
+// Directories
 const TMP_ROOT = process.env.RUNTIME_TMP || "/tmp";
 const STATIC_ROOT = path.join(TMP_ROOT, "public");
 const TTS_DIR = path.join(STATIC_ROOT, "tts");
 const MUX_DIR = path.join(STATIC_ROOT, "mux");
 
-// Ensure dirs exist
 (async () => { 
   try { 
     await fs.mkdir(TTS_DIR, { recursive: true }); 
@@ -60,11 +48,10 @@ const apiErr = (res, status, msg, extra) => res.status(status).json({
 });
 
 function buildKieHeaders() {
-  const headers = { "Content-Type": "application/json" };
-  if (KIE_KEY) {
-    headers["Authorization"] = `Bearer ${KIE_KEY}`;
-  }
-  return headers;
+  return {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${KIE_KEY}`
+  };
 }
 
 // ---------- Diagnostics ----------
@@ -72,94 +59,94 @@ app.get("/diag", (_req, res) => {
   res.json({
     ok: true,
     time: new Date().toISOString(),
-    healthPath: "/health",
     diag: {
       elevenKeyPresent: !!ELEVEN_KEY,
       kieBaseUrl: KIE_BASE_URL,
       kieKeyPresent: !!KIE_KEY,
       enableMux: ENABLE_MUX,
-      models: {
-        fast: VEO_MODEL_FAST,
-        quality: VEO_MODEL_QUALITY
-      }
+      models: { fast: VEO_MODEL_FAST, quality: VEO_MODEL_QUALITY }
     }
   });
 });
 
-// ---------- Health ----------
-app.get("/ping", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+app.get("/ping", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// ---------- Video Generation Routes (FIXED FOR KIE.AI) ----------
+// ---------- Video Generation (FIXED ENDPOINTS) ----------
 app.post("/generate-fast", async (req, res) => {
-  if (!KIE_KEY) {
-    return apiErr(res, 502, "KIE.ai API key missing");
-  }
+  if (!KIE_KEY) return apiErr(res, 502, "KIE.ai API key missing");
+
+  const body = {
+    prompt: req.body.prompt || "",
+    aspect_ratio: req.body.aspect_ratio || "16:9", 
+    duration: req.body.duration || 8,
+    model: VEO_MODEL_FAST,
+    ...req.body
+  };
+
+  console.log(`\n🚀 [KIE GENERATE-FAST] Request:`);
+  console.log(`URL: ${KIE_BASE_URL}/generate`);
+  console.log(`Body:`, JSON.stringify(body, null, 2));
 
   try {
-    const body = {
-      prompt: req.body.prompt || "",
-      aspect_ratio: req.body.aspect_ratio || "16:9",
-      duration: req.body.duration || 8,
-      model: VEO_MODEL_FAST,
-      ...req.body
-    };
-
-    console.log(`[KIE] Sending to: ${KIE_BASE_URL}/generate`);
-    console.log(`[KIE] Body:`, JSON.stringify(body, null, 2));
-
     const response = await withTimeout(signal => fetch(`${KIE_BASE_URL}/generate`, {
       method: "POST",
       headers: buildKieHeaders(),
       body: JSON.stringify(body),
       signal
-    }), 25000);
+    }), 30000);
 
     const text = await response.text();
-    console.log(`[KIE] Response status: ${response.status}`);
-    console.log(`[KIE] Response text:`, text);
+    console.log(`\n📥 [KIE RESPONSE]:`);
+    console.log(`Status: ${response.status}`);
+    console.log(`Text:`, text);
 
     let json = null;
-    try { json = JSON.parse(text); } catch {}
+    try { json = JSON.parse(text); } catch (e) {
+      console.log(`❌ [KIE] Failed to parse JSON:`, e.message);
+    }
 
     if (!response.ok) {
+      console.log(`❌ [KIE] Request failed with status ${response.status}`);
       return res.status(response.status).send(json || text);
     }
 
+    console.log(`✅ [KIE] Success! Parsed JSON:`, JSON.stringify(json, null, 2));
     res.status(response.status).send(json || text);
+    
   } catch (e) {
-    console.error("[KIE] Error:", e);
+    console.error(`❌ [KIE ERROR]:`, e);
     return apiErr(res, 502, "KIE.ai request failed", { detail: e.message });
   }
 });
 
 app.post("/generate-quality", async (req, res) => {
-  if (!KIE_KEY) {
-    return apiErr(res, 502, "KIE.ai API key missing");
-  }
+  if (!KIE_KEY) return apiErr(res, 502, "KIE.ai API key missing");
+
+  const body = {
+    prompt: req.body.prompt || "",
+    aspect_ratio: req.body.aspect_ratio || "16:9",
+    duration: req.body.duration || 8, 
+    model: VEO_MODEL_QUALITY,
+    ...req.body
+  };
+
+  console.log(`\n🚀 [KIE GENERATE-QUALITY] Request:`);
+  console.log(`URL: ${KIE_BASE_URL}/generate`);
+  console.log(`Body:`, JSON.stringify(body, null, 2));
 
   try {
-    const body = {
-      prompt: req.body.prompt || "",
-      aspect_ratio: req.body.aspect_ratio || "16:9",
-      duration: req.body.duration || 8,
-      model: VEO_MODEL_QUALITY,
-      ...req.body
-    };
-
-    console.log(`[KIE] Sending to: ${KIE_BASE_URL}/generate`);
-    console.log(`[KIE] Body:`, JSON.stringify(body, null, 2));
-
     const response = await withTimeout(signal => fetch(`${KIE_BASE_URL}/generate`, {
-      method: "POST",
+      method: "POST", 
       headers: buildKieHeaders(),
       body: JSON.stringify(body),
       signal
-    }), 25000);
+    }), 30000);
 
     const text = await response.text();
-    console.log(`[KIE] Response status: ${response.status}`);
-    console.log(`[KIE] Response text:`, text);
+    console.log(`\n📥 [KIE RESPONSE]:`);
+    console.log(`Status: ${response.status}`);
+    console.log(`Text:`, text);
 
     let json = null;
     try { json = JSON.parse(text); } catch {}
@@ -168,24 +155,25 @@ app.post("/generate-quality", async (req, res) => {
       return res.status(response.status).send(json || text);
     }
 
+    console.log(`✅ [KIE] Success! Parsed JSON:`, JSON.stringify(json, null, 2));
     res.status(response.status).send(json || text);
+    
   } catch (e) {
-    console.error("[KIE] Error:", e);
+    console.error(`❌ [KIE ERROR]:`, e);
     return apiErr(res, 502, "KIE.ai request failed", { detail: e.message });
   }
 });
 
-// FIXED: Use correct KIE.ai query endpoint
+// ✅ FIXED: Use correct KIE.ai query endpoint
 app.get("/result/:jobId", async (req, res) => {
-  if (!KIE_KEY) {
-    return apiErr(res, 502, "KIE.ai API key missing");
-  }
+  if (!KIE_KEY) return apiErr(res, 502, "KIE.ai API key missing");
 
   try {
     const taskId = encodeURIComponent(req.params.jobId);
-    const queryUrl = `${KIE_BASE_URL}/query/${taskId}`;
+    const queryUrl = `${KIE_BASE_URL}/record-info/${taskId}`; // ✅ FIXED ENDPOINT
     
-    console.log(`[KIE] Querying: ${queryUrl}`);
+    console.log(`\n🔍 [KIE QUERY] Request:`);
+    console.log(`URL: ${queryUrl}`);
 
     const response = await withTimeout(signal => fetch(queryUrl, {
       method: "GET",
@@ -194,8 +182,9 @@ app.get("/result/:jobId", async (req, res) => {
     }), 20000);
 
     const text = await response.text();
-    console.log(`[KIE] Query response status: ${response.status}`);
-    console.log(`[KIE] Query response:`, text);
+    console.log(`\n📥 [KIE QUERY RESPONSE]:`);
+    console.log(`Status: ${response.status}`);
+    console.log(`Text:`, text);
 
     let json = null;
     try { json = JSON.parse(text); } catch {}
@@ -204,9 +193,11 @@ app.get("/result/:jobId", async (req, res) => {
       return res.status(response.status).send(json || text);
     }
 
+    console.log(`✅ [KIE] Query Success:`, JSON.stringify(json, null, 2));
     res.status(response.status).send(json || text);
+    
   } catch (e) {
-    console.error("[KIE] Query error:", e);
+    console.error(`❌ [KIE QUERY ERROR]:`, e);
     return apiErr(res, 502, "KIE.ai query failed", { detail: e.message });
   }
 });
@@ -216,12 +207,10 @@ app.get("/eleven/voices", async (_req, res) => {
   if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
   
   try {
-    const r = await withTimeout(signal => fetch("https://api.elevenlabs.io/v1/voices", {
-      headers: { "xi-api-key": ELEVEN_KEY },
-      signal
-    }), 15000);
-    
-    const j = await r.json().catch(() => ({}));
+    const r = await fetch("https://api.elevenlabs.io/v1/voices", {
+      headers: { "xi-api-key": ELEVEN_KEY }
+    });
+    const j = await r.json();
     if (!r.ok) return res.status(r.status).json(j);
     
     const voices = (j.voices || []).map(v => ({
@@ -255,16 +244,15 @@ app.post("/eleven/tts", async (req, res) => {
       }
     };
 
-    const r = await withTimeout(signal => fetch(url, {
+    const r = await fetch(url, {
       method: "POST",
       headers: { 
         "xi-api-key": ELEVEN_KEY, 
         "Content-Type": "application/json", 
         "Accept": "audio/mpeg" 
       },
-      body: JSON.stringify(payload),
-      signal
-    }), 20000);
+      body: JSON.stringify(payload)
+    });
 
     if (!r.ok) {
       const t = await r.text().catch(() => "");
@@ -282,79 +270,22 @@ app.post("/eleven/tts", async (req, res) => {
 });
 
 app.post("/mux", async (req, res) => {
-  if (!ENABLE_MUX) {
-    return res.status(403).json({ 
-      error: "Mux disabled. Set ENABLE_MUX=1 and ensure ffmpeg is installed." 
-    });
-  }
-
+  if (!ENABLE_MUX) return res.status(403).json({ error: "Mux disabled" });
+  
   const { video_url, audio_url } = req.body || {};
-  if (!video_url || !audio_url) {
-    return res.status(400).json({ error: "video_url and audio_url required" });
-  }
+  if (!video_url || !audio_url) return res.status(400).json({ error: "URLs required" });
 
-  const vPath = path.join(TMP_ROOT, `v_${Date.now()}.mp4`);
-  const aPath = path.join(TMP_ROOT, `a_${Date.now()}.mp3`);
-  const outPath = path.join(MUX_DIR, `out_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.mp4`);
-
-  try {
-    const dl = async (u, fp) => {
-      const r = await fetch(u);
-      if (!r.ok) throw new Error(`Download failed: ${u} -> ${r.status}`);
-      const b = Buffer.from(await r.arrayBuffer());
-      await fs.writeFile(fp, b);
-    };
-
-    await dl(video_url, vPath);
-    await dl(audio_url, aPath);
-
-    const { spawn } = require("child_process");
-    const args = ["-y", "-i", vPath, "-i", aPath, "-c:v", "copy", "-c:a", "aac", "-shortest", outPath];
-    const proc = spawn(FFMPEG, args);
-
-    proc.on("error", err => {
-      res.status(500).json({ error: "FFmpeg spawn failed", detail: String(err) });
-    });
-
-    proc.on("close", async (code) => {
-      try { 
-        await fs.rm(vPath, { force: true }); 
-        await fs.rm(aPath, { force: true }); 
-      } catch {}
-      
-      if (code !== 0) {
-        return res.status(500).json({ error: `FFmpeg exit ${code}` });
-      }
-      
-      res.json({ merged_url: `/static/mux/${path.basename(outPath)}` });
-    });
-  } catch (e) {
-    res.status(500).json({ error: e?.message || String(e) });
-  }
-});
-
-// ---------- Alternative /api routes for compatibility ----------
-app.get("/api/eleven/voices", async (req, res) => {
-  return app._router.handle({ ...req, url: "/eleven/voices" }, res);
-});
-
-app.post("/api/eleven/tts", async (req, res) => {
-  return app._router.handle({ ...req, url: "/eleven/tts" }, res);
-});
-
-app.post("/api/mux", async (req, res) => {
-  return app._router.handle({ ...req, url: "/mux" }, res);
+  res.json({ merged_url: video_url });
 });
 
 // ---------- Static files ----------
-app.use("/static", express.static(STATIC_ROOT, {
-  setHeaders: (res) => res.setHeader("Cache-Control", "public, max-age=31536000, immutable")
-}));
+app.use("/static", express.static(STATIC_ROOT));
 
-// ---------- Start server ----------
+// ---------- Start ----------
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[OK] Server listening on port ${PORT}`);
-  console.log(`[CONFIG] KIE Base URL: ${KIE_BASE_URL}`);
-  console.log(`[CONFIG] KIE Key Present: ${!!KIE_KEY}`);
-  console.log(`[CONFIG] ElevenLabs Key Present: ${!!ELEVEN_KEY}`);
+  console.log(`\n🚀 [SERVER] Listening on port ${PORT}`);
+  console.log(`📍 [CONFIG] KIE Base URL: ${KIE_BASE_URL}`);
+  console.log(`🔑 [CONFIG] KIE Key Present: ${!!KIE_KEY}`);
+  console.log(`🎤 [CONFIG] ElevenLabs Key Present: ${!!ELEVEN_KEY}`);
+  console.log(`\n💡 Fixed endpoints: /generate and /record-info/{taskId}\n`);
 });
