@@ -20,8 +20,8 @@ const PORT = process.env.PORT || 8080;
 // ElevenLabs API key
 const ELEVEN_KEY = process.env.ELEVEN_LABS || "";
 
-// KIE.ai configuration (fixed to use KIE_API_PREFIX)
-const VEO_UPSTREAM = process.env.KIE_API_PREFIX || "https://api.kie.ai/api/v1";
+// KIE.ai configuration (FIXED ENDPOINTS)
+const KIE_BASE_URL = "https://api.kie.ai/api/v1/veo3";
 const KIE_KEY = process.env.KIE_KEY || "";
 
 // Model defaults
@@ -59,17 +59,12 @@ const apiErr = (res, status, msg, extra) => res.status(status).json({
   ...(extra || {}) 
 });
 
-function buildUpstreamHeaders() {
-  const h = { "Content-Type": "application/json" };
+function buildKieHeaders() {
+  const headers = { "Content-Type": "application/json" };
   if (KIE_KEY) {
-    h["Authorization"] = `Bearer ${KIE_KEY}`;
-    h["x-api-key"] = KIE_KEY;
+    headers["Authorization"] = `Bearer ${KIE_KEY}`;
   }
-  return h;
-}
-
-function joinUrl(base, p) { 
-  return base + (p.startsWith("/") ? p : `/${p}`); 
+  return headers;
 }
 
 // ---------- Diagnostics ----------
@@ -80,8 +75,7 @@ app.get("/diag", (_req, res) => {
     healthPath: "/health",
     diag: {
       elevenKeyPresent: !!ELEVEN_KEY,
-      upstreamSet: !!VEO_UPSTREAM,
-      upstream: VEO_UPSTREAM || null,
+      kieBaseUrl: KIE_BASE_URL,
       kieKeyPresent: !!KIE_KEY,
       enableMux: ENABLE_MUX,
       models: {
@@ -96,26 +90,35 @@ app.get("/diag", (_req, res) => {
 app.get("/ping", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// ---------- Video Generation Routes ----------
+// ---------- Video Generation Routes (FIXED FOR KIE.AI) ----------
 app.post("/generate-fast", async (req, res) => {
-  if (!VEO_UPSTREAM || !KIE_KEY) {
-    return apiErr(res, 502, "KIE.ai configuration missing");
+  if (!KIE_KEY) {
+    return apiErr(res, 502, "KIE.ai API key missing");
   }
 
   try {
     const body = {
-      ...req.body,
-      model: VEO_MODEL_FAST
+      prompt: req.body.prompt || "",
+      aspect_ratio: req.body.aspect_ratio || "16:9",
+      duration: req.body.duration || 8,
+      model: VEO_MODEL_FAST,
+      ...req.body
     };
 
-    const response = await withTimeout(signal => fetch(`${VEO_UPSTREAM}/veo3/generate`, {
+    console.log(`[KIE] Sending to: ${KIE_BASE_URL}/generate`);
+    console.log(`[KIE] Body:`, JSON.stringify(body, null, 2));
+
+    const response = await withTimeout(signal => fetch(`${KIE_BASE_URL}/generate`, {
       method: "POST",
-      headers: buildUpstreamHeaders(),
+      headers: buildKieHeaders(),
       body: JSON.stringify(body),
       signal
     }), 25000);
 
     const text = await response.text();
+    console.log(`[KIE] Response status: ${response.status}`);
+    console.log(`[KIE] Response text:`, text);
+
     let json = null;
     try { json = JSON.parse(text); } catch {}
 
@@ -125,29 +128,39 @@ app.post("/generate-fast", async (req, res) => {
 
     res.status(response.status).send(json || text);
   } catch (e) {
+    console.error("[KIE] Error:", e);
     return apiErr(res, 502, "KIE.ai request failed", { detail: e.message });
   }
 });
 
 app.post("/generate-quality", async (req, res) => {
-  if (!VEO_UPSTREAM || !KIE_KEY) {
-    return apiErr(res, 502, "KIE.ai configuration missing");
+  if (!KIE_KEY) {
+    return apiErr(res, 502, "KIE.ai API key missing");
   }
 
   try {
     const body = {
-      ...req.body,
-      model: VEO_MODEL_QUALITY
+      prompt: req.body.prompt || "",
+      aspect_ratio: req.body.aspect_ratio || "16:9",
+      duration: req.body.duration || 8,
+      model: VEO_MODEL_QUALITY,
+      ...req.body
     };
 
-    const response = await withTimeout(signal => fetch(`${VEO_UPSTREAM}/generate`, {
+    console.log(`[KIE] Sending to: ${KIE_BASE_URL}/generate`);
+    console.log(`[KIE] Body:`, JSON.stringify(body, null, 2));
+
+    const response = await withTimeout(signal => fetch(`${KIE_BASE_URL}/generate`, {
       method: "POST",
-      headers: buildUpstreamHeaders(),
+      headers: buildKieHeaders(),
       body: JSON.stringify(body),
       signal
     }), 25000);
 
     const text = await response.text();
+    console.log(`[KIE] Response status: ${response.status}`);
+    console.log(`[KIE] Response text:`, text);
+
     let json = null;
     try { json = JSON.parse(text); } catch {}
 
@@ -157,24 +170,33 @@ app.post("/generate-quality", async (req, res) => {
 
     res.status(response.status).send(json || text);
   } catch (e) {
+    console.error("[KIE] Error:", e);
     return apiErr(res, 502, "KIE.ai request failed", { detail: e.message });
   }
 });
 
+// FIXED: Use correct KIE.ai query endpoint
 app.get("/result/:jobId", async (req, res) => {
-  if (!VEO_UPSTREAM || !KIE_KEY) {
-    return apiErr(res, 502, "KIE.ai configuration missing");
+  if (!KIE_KEY) {
+    return apiErr(res, 502, "KIE.ai API key missing");
   }
 
   try {
-    const id = encodeURIComponent(req.params.jobId);
-    const response = await withTimeout(signal => fetch(`${VEO_UPSTREAM}/result/${id}`, {
+    const taskId = encodeURIComponent(req.params.jobId);
+    const queryUrl = `${KIE_BASE_URL}/query/${taskId}`;
+    
+    console.log(`[KIE] Querying: ${queryUrl}`);
+
+    const response = await withTimeout(signal => fetch(queryUrl, {
       method: "GET",
-      headers: buildUpstreamHeaders(),
+      headers: buildKieHeaders(),
       signal
     }), 20000);
 
     const text = await response.text();
+    console.log(`[KIE] Query response status: ${response.status}`);
+    console.log(`[KIE] Query response:`, text);
+
     let json = null;
     try { json = JSON.parse(text); } catch {}
 
@@ -184,7 +206,8 @@ app.get("/result/:jobId", async (req, res) => {
 
     res.status(response.status).send(json || text);
   } catch (e) {
-    return apiErr(res, 502, "KIE.ai result request failed", { detail: e.message });
+    console.error("[KIE] Query error:", e);
+    return apiErr(res, 502, "KIE.ai query failed", { detail: e.message });
   }
 });
 
@@ -275,7 +298,6 @@ app.post("/mux", async (req, res) => {
   const outPath = path.join(MUX_DIR, `out_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.mp4`);
 
   try {
-    // Download files
     const dl = async (u, fp) => {
       const r = await fetch(u);
       if (!r.ok) throw new Error(`Download failed: ${u} -> ${r.status}`);
@@ -286,7 +308,6 @@ app.post("/mux", async (req, res) => {
     await dl(video_url, vPath);
     await dl(audio_url, aPath);
 
-    // Run FFmpeg
     const { spawn } = require("child_process");
     const args = ["-y", "-i", vPath, "-i", aPath, "-c:v", "copy", "-c:a", "aac", "-shortest", outPath];
     const proc = spawn(FFMPEG, args);
@@ -333,7 +354,7 @@ app.use("/static", express.static(STATIC_ROOT, {
 // ---------- Start server ----------
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`[OK] Server listening on port ${PORT}`);
-  console.log(`[CONFIG] KIE Upstream: ${VEO_UPSTREAM}`);
+  console.log(`[CONFIG] KIE Base URL: ${KIE_BASE_URL}`);
   console.log(`[CONFIG] KIE Key Present: ${!!KIE_KEY}`);
   console.log(`[CONFIG] ElevenLabs Key Present: ${!!ELEVEN_KEY}`);
 });
