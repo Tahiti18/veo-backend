@@ -28,7 +28,7 @@ const ELEVEN_KEY =
 // Upstream base for video generation
 const VEO_UPSTREAM = (process.env.VEO_BACKEND_URL || process.env.VEO_WORKER_URL || process.env.KIE_API_PREFIX || "").replace(/\/$/,"");
 
-// “Preferred” paths from env (we still auto-fallback if these 404)
+// "Preferred" paths from env (we still auto-fallback if these 404)
 const VEO_FAST_PATH    = process.env.VEO_FAST_PATH    || "/generate-fast";
 const VEO_QUALITY_PATH = process.env.VEO_QUALITY_PATH || "/generate-quality";
 const VEO_RESULT_PATH  = process.env.VEO_RESULT_PATH  || "/result"; // we append /:jobId
@@ -177,7 +177,7 @@ async function tryGetPaths(paths, res) {
   return apiErr(res, 502, "All upstream paths returned 404/failed", { attempts });
 }
 
-// ---------- FRONTEND-FACING ROUTES (FIXED) ----------
+// ---------- FRONTEND-FACING ROUTES ----------
 
 // FAST → upstream /generate with fast model (fallbacks kept)
 app.post("/generate-fast", async (req, res) => {
@@ -224,8 +224,10 @@ app.get("/result/:jobId", async (req, res) => {
   return tryGetPaths(paths, res);
 });
 
-// ---------- ElevenLabs: list voices ----------
-app.get("/api/eleven/voices", async (_req, res) => {
+// ---------- ElevenLabs routes (both /api and without /api for compatibility) ----------
+
+// Frontend expects these routes WITHOUT /api prefix
+app.get("/eleven/voices", async (_req, res) => {
   if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
   try {
     const r = await withTimeout(signal => fetch("https://api.elevenlabs.io/v1/voices", {
@@ -240,65 +242,21 @@ app.get("/api/eleven/voices", async (_req, res) => {
   }
 });
 
-// ---------- ElevenLabs: TTS streaming ----------
-app.post("/api/eleven/tts.stream", async (req, res) => {
-  try {
-    if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
-    const { voice_id, text, model_id, params } = req.body || {};
-    if (!voice_id || !text) return res.status(400).json({ error: "voice_id and text required" });
-
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice_id)}?optimize_streaming_latency=0`;
-    const payload = {
-      text,
-      model_id: model_id || "eleven_multilingual_v2",
-      voice_settings: {
-        stability: params?.stability ?? 0.45,
-        similarity_boost: params?.similarity_boost ?? 0.8,
-        style: params?.style ?? 0.0,
-        use_speaker_boost: params?.use_speaker_boost ?? true
-      }
-    };
-
-    const r = await withTimeout(signal => fetch(url, {
-      method:"POST",
-      headers:{ "xi-api-key": ELEVEN_KEY, "Content-Type":"application/json", "Accept":"audio/mpeg" },
-      body: JSON.stringify(payload), signal
-    }), 20000);
-
-    if (!r.ok) {
-      const errText = await r.text().catch(()=> "");
-      return res.status(r.status).json({ error: "ElevenLabs error", detail: errText });
-    }
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    const len = r.headers.get("content-length");
-    if (len) res.setHeader("Content-Length", len);
-    if (String(req.query.download||"") === "1") res.setHeader("Content-Disposition", 'attachment; filename="voiceover.mp3"');
-
-    const nodeStream = Readable.fromWeb(r.body);
-    await pipe(nodeStream, res);
-  } catch (e) {
-    if (!res.headersSent) res.status(502).json({ error: e?.message || String(e) });
-    else try { res.destroy(e); } catch {}
-  }
-});
-
-// ---------- ElevenLabs: TTS save-to-disk ----------
-app.post("/api/eleven/tts", async (req, res) => {
+app.post("/eleven/tts", async (req, res) => {
   if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
-  const { voice_id, text, model_id, params } = req.body || {};
+  const { voice_id, text, model_id } = req.body || {};
   if (!voice_id || !text) return res.status(400).json({ error: "voice_id and text required" });
 
   try {
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice_id)}?optimize_streaming_latency=0`;
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice_id)}`;
     const payload = {
       text,
       model_id: model_id || "eleven_multilingual_v2",
       voice_settings: {
-        stability: params?.stability ?? 0.45,
-        similarity_boost: params?.similarity_boost ?? 0.8,
-        style: params?.style ?? 0.0,
-        use_speaker_boost: params?.use_speaker_boost ?? true
+        stability: 0.45,
+        similarity_boost: 0.8,
+        style: 0.0,
+        use_speaker_boost: true
       }
     };
     const r = await withTimeout(signal => fetch(url, {
@@ -319,36 +277,90 @@ app.post("/api/eleven/tts", async (req, res) => {
   }
 });
 
-// ---------- ElevenLabs: iPad GET test ----------
-app.get("/api/eleven/test-tts", async (req, res) => {
+app.post("/mux", async (req, res) => {
+  if (!ENABLE_MUX) return res.status(403).json({ error: "Mux disabled. Set ENABLE_MUX=1 and ensure ffmpeg is installed." });
+  const { video_url, audio_url } = req.body || {};
+  if (!video_url || !audio_url) return res.status(400).json({ error: "video_url and audio_url required" });
+
+  const vPath = path.join(TMP_ROOT, `v_${Date.now()}.mp4`);
+  const aPath = path.join(TMP_ROOT, `a_${Date.now()}.mp3`);
+  const outPath = path.join(MUX_DIR, `out_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.mp4`);
+
   try {
-    if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
-    const voiceId = String(req.query.voice_id || "21m00Tcm4TlvDq8ikWAM"); // Rachel
-    const text = String(req.query.text || "Hello Marwan, your Unity Lab backend generated this voice successfully.");
+    const dl = async (u, fp) => {
+      const r = await fetch(u);
+      if (!r.ok) throw new Error(`Download failed: ${u} -> ${r.status}`);
+      const b = Buffer.from(await r.arrayBuffer());
+      await fs.writeFile(fp, b);
+    };
+    await dl(video_url, vPath);
+    await dl(audio_url, aPath);
 
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?optimize_streaming_latency=0`;
-    const payload = { text, model_id: "eleven_multilingual_v2",
-      voice_settings: { stability:0.45, similarity_boost:0.8, style:0.0, use_speaker_boost:true } };
-
-    const r = await withTimeout(signal => fetch(url, {
-      method:"POST", headers:{ "xi-api-key":ELEVEN_KEY, "Content-Type":"application/json", "Accept":"audio/mpeg" },
-      body: JSON.stringify(payload), signal
-    }), 20000);
-    if (!r.ok) {
-      const errText = await r.text().catch(()=> "");
-      return res.status(r.status).json({ error: "ElevenLabs error", detail: errText });
-    }
-    res.setHeader("Content-Type","audio/mpeg");
-    res.setHeader("Content-Disposition",'attachment; filename="unitylab-test.mp3"');
-    const nodeStream = Readable.fromWeb(r.body);
-    await pipe(nodeStream, res);
+    const { spawn } = require("child_process");
+    const args = ["-y", "-i", vPath, "-i", aPath, "-c:v", "copy", "-c:a", "aac", "-shortest", outPath];
+    const proc = spawn(FFMPEG, args);
+    proc.on("error", err => res.status(500).json({ error: "FFmpeg spawn failed", detail: String(err) }));
+    proc.on("close", async (code) => {
+      try { await fs.rm(vPath,{force:true}); await fs.rm(aPath,{force:true}); } catch {}
+      if (code !== 0) return res.status(500).json({ error: `FFmpeg exit ${code}` });
+      res.json({ merged_url: `/static/mux/${path.basename(outPath)}` });
+    });
   } catch (e) {
-    if (!res.headersSent) res.status(502).json({ error: e?.message || String(e) });
-    else try { res.destroy(e); } catch {}
+    res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
-// ---------- Optional: simple mux ----------
+// Alternative routes WITH /api prefix (backup compatibility)
+app.get("/api/eleven/voices", async (_req, res) => {
+  if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
+  try {
+    const r = await withTimeout(signal => fetch("https://api.elevenlabs.io/v1/voices", {
+      headers: { "xi-api-key": ELEVEN_KEY }, signal
+    }), 15000);
+    const j = await r.json().catch(()=> ({}));
+    if (!r.ok) return res.status(r.status).json(j);
+    const voices = (j.voices||[]).map(v => ({ id: v.voice_id || v.id, name: v.name, category: v.category||"" }));
+    res.json({ voices });
+  } catch (e) {
+    res.status(502).json({ error: e?.message || String(e) });
+  }
+});
+
+app.post("/api/eleven/tts", async (req, res) => {
+  if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
+  const { voice_id, text, model_id } = req.body || {};
+  if (!voice_id || !text) return res.status(400).json({ error: "voice_id and text required" });
+
+  try {
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice_id)}`;
+    const payload = {
+      text,
+      model_id: model_id || "eleven_multilingual_v2",
+      voice_settings: {
+        stability: 0.45,
+        similarity_boost: 0.8,
+        style: 0.0,
+        use_speaker_boost: true
+      }
+    };
+    const r = await withTimeout(signal => fetch(url, {
+      method:"POST",
+      headers:{ "xi-api-key": ELEVEN_KEY, "Content-Type":"application/json", "Accept":"audio/mpeg" },
+      body: JSON.stringify(payload), signal
+    }), 20000);
+    if (!r.ok) {
+      const t = await r.text().catch(()=> "");
+      return res.status(r.status).json({ error: "ElevenLabs error", detail: t });
+    }
+    const buf = Buffer.from(await r.arrayBuffer());
+    const fname = `tts_${Date.now()}_${crypto.randomBytes(5).toString("hex")}.mp3`;
+    await fs.writeFile(path.join(TTS_DIR, fname), buf);
+    res.json({ audio_url: `/static/tts/${fname}`, bytes: buf.length });
+  } catch (e) {
+    res.status(502).json({ error: e?.message || String(e) });
+  }
+});
+
 app.post("/api/mux", async (req, res) => {
   if (!ENABLE_MUX) return res.status(403).json({ error: "Mux disabled. Set ENABLE_MUX=1 and ensure ffmpeg is installed." });
   const { video_url, audio_url } = req.body || {};
@@ -382,10 +394,39 @@ app.post("/api/mux", async (req, res) => {
   }
 });
 
-// ---------- Static ----------
+// ---------- Test route ----------
+app.get("/api/eleven/test-tts", async (req, res) => {
+  try {
+    if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
+    const voiceId = String(req.query.voice_id || "21m00Tcm4TlvDq8ikWAM"); // Rachel
+    const text = String(req.query.text || "Hello, your Unity Lab backend is working successfully.");
+
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`;
+    const payload = { text, model_id: "eleven_multilingual_v2",
+      voice_settings: { stability:0.45, similarity_boost:0.8, style:0.0, use_speaker_boost:true } };
+
+    const r = await withTimeout(signal => fetch(url, {
+      method:"POST", headers:{ "xi-api-key":ELEVEN_KEY, "Content-Type":"application/json", "Accept":"audio/mpeg" },
+      body: JSON.stringify(payload), signal
+    }), 20000);
+    if (!r.ok) {
+      const errText = await r.text().catch(()=> "");
+      return res.status(r.status).json({ error: "ElevenLabs error", detail: errText });
+    }
+    res.setHeader("Content-Type","audio/mpeg");
+    res.setHeader("Content-Disposition",'attachment; filename="test.mp3"');
+    const nodeStream = Readable.fromWeb(r.body);
+    await pipe(nodeStream, res);
+  } catch (e) {
+    if (!res.headersSent) res.status(502).json({ error: e?.message || String(e) });
+    else try { res.destroy(e); } catch {}
+  }
+});
+
+// ---------- Static files ----------
 app.use("/static", express.static(STATIC_ROOT, {
   setHeaders: (res) => res.setHeader("Cache-Control","public, max-age=31536000, immutable")
 }));
 
-// ---------- Start ----------
-app.listen(PORT, "0.0.0.0", () => console.log(`[OK] Listening on ${PORT}`));
+// ---------- Start server ----------
+app.listen(PORT, "0.0.0.0", () => console.log(`[OK] Server listening on port ${PORT}`));
