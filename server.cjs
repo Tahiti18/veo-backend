@@ -1,10 +1,7 @@
 // server.cjs — Unity Lab backend (CommonJS, Node >=20)
-// - Fixes 404s: proxies /generate-* and /result/:id to your upstream (VEO_BACKEND_URL / KIE_API_PREFIX)
-// - Sends KIE_KEY to upstream via Authorization: Bearer and x-api-key (covers both auth styles)
-// - ElevenLabs: accepts ELEVEN_LABS, ELEVENLABS_API_KEY, ELEVEN_LABS_API_KEY, and "11_Labs"
-// - TTS streaming + iPad test; optional saved MP3 in /tmp/public/tts
-// - Optional mux (ENABLE_MUX=1 + ffmpeg); static files served from /tmp/public
-// - Adds /diag so you can sanity-check config without exposing secrets
+// Smart-proxy for generate/result (tries multiple upstream paths automatically)
+// ElevenLabs endpoints (voices, TTS streaming, iPad test)
+// Optional mux (ENABLE_MUX=1 + ffmpeg). Static served from /tmp/public.
 
 const express = require("express");
 const cors = require("cors");
@@ -30,16 +27,15 @@ const ELEVEN_KEY =
   process.env["11_Labs"] ||
   "";
 
-// Upstream for video generation (use whichever you provided)
-const VEO_UPSTREAM =
-  (process.env.VEO_BACKEND_URL || process.env.VEO_WORKER_URL || process.env.KIE_API_PREFIX || "").replace(/\/$/,"");
+// Upstream base for video generation
+const VEO_UPSTREAM = (process.env.VEO_BACKEND_URL || process.env.VEO_WORKER_URL || process.env.KIE_API_PREFIX || "").replace(/\/$/,"");
 
-// Allow overriding paths if your upstream doesn’t use our defaults
+// “Preferred” paths from env (we still auto-fallback if these 404)
 const VEO_FAST_PATH    = process.env.VEO_FAST_PATH    || "/generate-fast";
 const VEO_QUALITY_PATH = process.env.VEO_QUALITY_PATH || "/generate-quality";
 const VEO_RESULT_PATH  = process.env.VEO_RESULT_PATH  || "/result"; // we append /:jobId
 
-// Auth for upstream (we’ll send both header styles, only if present)
+// Auth for upstream (send both header styles if present)
 const KIE_KEY = process.env.KIE_KEY || process.env.VEO_API_KEY || "";
 
 // Mux/FFmpeg options
@@ -53,13 +49,10 @@ const TTS_DIR     = path.join(STATIC_ROOT, "tts");
 const MUX_DIR     = path.join(STATIC_ROOT, "mux");
 
 // Ensure dirs exist
-(async () => { try {
-  await fs.mkdir(TTS_DIR, { recursive: true });
-  await fs.mkdir(MUX_DIR, { recursive: true });
-} catch (_) {} })();
+(async () => { try { await fs.mkdir(TTS_DIR, { recursive: true }); await fs.mkdir(MUX_DIR, { recursive: true }); } catch (_) {} })();
 
 // ---------- Helpers ----------
-function withTimeout(fn, ms = 20000) {
+function withTimeout(fn, ms = 25000) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), ms);
   return Promise.resolve(fn(ac.signal)).finally(() => clearTimeout(t));
@@ -69,11 +62,12 @@ const apiErr = (res, status, msg, extra) => res.status(status).json({ success:fa
 function buildUpstreamHeaders() {
   const h = { "Content-Type": "application/json" };
   if (KIE_KEY) {
-    h["Authorization"] = `Bearer ${KIE_KEY}`;
-    h["x-api-key"] = KIE_KEY;
+    h["Authorization"] = `Bearer ${KIE_KEY}`; // covers bearer auth
+    h["x-api-key"] = KIE_KEY;                 // covers api-key style
   }
   return h;
 }
+function joinUrl(base, p) { return base + (p.startsWith("/") ? p : `/${p}`); }
 
 // ---------- Diagnostics (no secrets leaked) ----------
 app.get("/diag", (_req, res) => {
@@ -84,7 +78,7 @@ app.get("/diag", (_req, res) => {
     diag: {
       elevenKeyPresent: !!ELEVEN_KEY,
       upstreamSet: !!VEO_UPSTREAM,
-      upstream: VEO_UPSTREAM ? (new URL(VEO_UPSTREAM)).origin + (new URL(VEO_UPSTREAM)).pathname : null,
+      upstream: VEO_UPSTREAM || null,
       paths: { fast: VEO_FAST_PATH, quality: VEO_QUALITY_PATH, resultBase: VEO_RESULT_PATH },
       kieKeyPresent: !!KIE_KEY,
       enableMux: ENABLE_MUX
@@ -92,47 +86,143 @@ app.get("/diag", (_req, res) => {
   });
 });
 
+// Probe common upstream paths and report status
+app.get("/diag/upstream", async (_req, res) => {
+  if (!VEO_UPSTREAM) return res.status(400).json({ error: "VEO_UPSTREAM not set" });
+
+  const candidates = [
+    // Configured
+    { name: "configured_fast",    path: VEO_FAST_PATH,                method: "POST" },
+    { name: "configured_quality", path: VEO_QUALITY_PATH,             method: "POST" },
+    { name: "configured_result",  path: `${VEO_RESULT_PATH}/test-id`, method: "GET"  },
+
+    // Common alternates
+    { name: "alt_fast_generate",       path: "/generate",                method: "POST" },
+    { name: "alt_fast_video",          path: "/video/generate-fast",     method: "POST" },
+    { name: "alt_fast_veo",            path: "/veo/generate-fast",       method: "POST" },
+    { name: "alt_fast_ai",             path: "/ai/generate-fast",        method: "POST" },
+    { name: "alt_quality_generate",    path: "/video/generate-quality",  method: "POST" },
+    { name: "alt_quality_veo",         path: "/veo/generate-quality",    method: "POST" },
+    { name: "alt_result_video",        path: "/video/result/test-id",    method: "GET"  },
+    { name: "alt_result_veo",          path: "/veo/result/test-id",      method: "GET"  }
+  ];
+
+  const results = {};
+  for (const c of candidates) {
+    const url = joinUrl(VEO_UPSTREAM, c.path);
+    try {
+      const r = await withTimeout(signal =>
+        fetch(url, c.method === "POST" ? {
+          method: "POST",
+          headers: buildUpstreamHeaders(),
+          body: JSON.stringify({ probe: true }),
+          signal
+        } : {
+          method: "GET",
+          headers: buildUpstreamHeaders(),
+          signal
+        }), 8000
+      );
+      const txt = (await r.text().catch(()=> "")).slice(0, 160);
+      results[c.name] = { url, method: c.method, status: r.status, ok: r.ok, sample: txt };
+    } catch (e) {
+      results[c.name] = { url, method: c.method, error: String(e?.message || e) };
+    }
+  }
+  res.json({ upstream: VEO_UPSTREAM, headersSent: !!KIE_KEY, results });
+});
+
 // ---------- Health ----------
 app.get("/ping", (_req,res)=>res.json({ ok:true, ts:new Date().toISOString() }));
 app.get("/health", (_req,res)=>res.json({ ok:true, ts:new Date().toISOString() }));
 
-// ---------- VEO pass-through (fixes your 404s) ----------
-async function proxyJsonPost(upPath, req, res) {
+// ---------- Smart proxy (tries multiple paths until one works) ----------
+async function tryPostPaths(paths, req, res) {
   if (!VEO_UPSTREAM) return apiErr(res, 502, "VEO_UPSTREAM missing. Set VEO_BACKEND_URL or KIE_API_PREFIX.");
-  try {
-    const r = await withTimeout(signal => fetch(VEO_UPSTREAM + upPath, {
-      method: "POST",
-      headers: buildUpstreamHeaders(),
-      body: JSON.stringify(req.body || {}),
-      signal
-    }), 30000);
-    const text = await r.text();
-    let data = {}; try { data = JSON.parse(text); } catch { data = { raw: text }; }
-    return res.status(r.status).json(data);
-  } catch (e) {
-    return apiErr(res, 502, e?.message || String(e));
+  const body = JSON.stringify(req.body || {});
+  const headers = buildUpstreamHeaders();
+
+  const attempts = [];
+  for (const p of paths) {
+    const url = joinUrl(VEO_UPSTREAM, p);
+    try {
+      const r = await withTimeout(signal => fetch(url, { method:"POST", headers, body, signal }), 25000);
+      const text = await r.text().catch(()=> "");
+      let json = null; try { json = JSON.parse(text); } catch {}
+      attempts.push({ path:p, status:r.status });
+      if (r.ok && (json || text)) {
+        return res.status(r.status).send(json ?? text);
+      }
+      if (r.status !== 404) {
+        // Not a 404 — return upstream message
+        return res.status(r.status).send(json ?? text);
+      }
+    } catch (e) {
+      attempts.push({ path:p, error:String(e?.message || e) });
+    }
   }
-}
-async function proxyJsonGet(upPath, res) {
-  if (!VEO_UPSTREAM) return apiErr(res, 502, "VEO_UPSTREAM missing. Set VEO_BACKEND_URL or KIE_API_PREFIX.");
-  try {
-    const r = await withTimeout(signal => fetch(VEO_UPSTREAM + upPath, {
-      method: "GET",
-      headers: buildUpstreamHeaders(),
-      signal
-    }), 30000);
-    const text = await r.text();
-    let data = {}; try { data = JSON.parse(text); } catch { data = { raw: text }; }
-    return res.status(r.status).json(data);
-  } catch (e) {
-    return apiErr(res, 502, e?.message || String(e));
-  }
+  return apiErr(res, 502, "All upstream paths returned 404/failed", { attempts });
 }
 
-// Endpoints your frontend calls:
-app.post("/generate-fast",    (req,res)=>proxyJsonPost(VEO_FAST_PATH, req, res));
-app.post("/generate-quality", (req,res)=>proxyJsonPost(VEO_QUALITY_PATH, req, res));
-app.get("/result/:jobId",     (req,res)=>proxyJsonGet(`${VEO_RESULT_PATH}/${encodeURIComponent(req.params.jobId)}`, res));
+async function tryGetPaths(paths, res) {
+  if (!VEO_UPSTREAM) return apiErr(res, 502, "VEO_UPSTREAM missing. Set VEO_BACKEND_URL or KIE_API_PREFIX.");
+  const headers = buildUpstreamHeaders();
+  const attempts = [];
+  for (const p of paths) {
+    const url = joinUrl(VEO_UPSTREAM, p);
+    try {
+      const r = await withTimeout(signal => fetch(url, { method:"GET", headers, signal }), 20000);
+      const text = await r.text().catch(()=> "");
+      let json = null; try { json = JSON.parse(text); } catch {}
+      attempts.push({ path:p, status:r.status });
+      if (r.ok && (json || text)) {
+        return res.status(r.status).send(json ?? text);
+      }
+      if (r.status !== 404) {
+        return res.status(r.status).send(json ?? text);
+      }
+    } catch (e) {
+      attempts.push({ path:p, error:String(e?.message || e) });
+    }
+  }
+  return apiErr(res, 502, "All upstream paths returned 404/failed", { attempts });
+}
+
+// Frontend-facing endpoints
+app.post("/generate-fast", async (req, res) => {
+  const paths = [
+    VEO_FAST_PATH,
+    "/generate-fast",
+    "/video/generate-fast",
+    "/veo/generate-fast",
+    "/ai/generate-fast",
+    "/generate" // some backends use generic /generate for fast
+  ];
+  return tryPostPaths(paths, req, res);
+});
+
+app.post("/generate-quality", async (req, res) => {
+  const paths = [
+    VEO_QUALITY_PATH,
+    "/generate-quality",
+    "/video/generate-quality",
+    "/veo/generate-quality",
+    "/ai/generate-quality"
+  ];
+  return tryPostPaths(paths, req, res);
+});
+
+app.get("/result/:jobId", async (req, res) => {
+  const id = encodeURIComponent(req.params.jobId);
+  const paths = [
+    `${VEO_RESULT_PATH}/${id}`,
+    `/result/${id}`,
+    `/video/result/${id}`,
+    `/veo/result/${id}`,
+    `/ai/result/${id}`
+  ];
+  return tryGetPaths(paths, res);
+});
 
 // ---------- ElevenLabs: list voices ----------
 app.get("/api/eleven/voices", async (_req, res) => {
@@ -150,7 +240,7 @@ app.get("/api/eleven/voices", async (_req, res) => {
   }
 });
 
-// ---------- ElevenLabs: TTS streaming (best for UI preview; no disk) ----------
+// ---------- ElevenLabs: TTS streaming (no disk; great for preview) ----------
 app.post("/api/eleven/tts.stream", async (req, res) => {
   try {
     if (!ELEVEN_KEY) return res.status(401).json({ error: "ElevenLabs key missing" });
