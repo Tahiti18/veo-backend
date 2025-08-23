@@ -108,7 +108,7 @@ app.post("/generate-fast", async (req, res) => {
       model: VEO_MODEL_FAST
     };
 
-    const response = await withTimeout(signal => fetch(`${VEO_UPSTREAM}/generate`, {
+    const response = await withTimeout(signal => fetch(`${VEO_UPSTREAM}/veo3/generate`, {
       method: "POST",
       headers: buildUpstreamHeaders(),
       body: JSON.stringify(body),
